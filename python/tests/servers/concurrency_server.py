@@ -5,7 +5,7 @@ UDF server with concurrency-limited functions for testing max_concurrency.
 
 import logging
 import time
-from lake_udf import udf, UDFServer
+from tidbcloudlake_udf import udf, UDFServer
 
 logging.basicConfig(level=logging.INFO)
 

@@ -4,7 +4,7 @@
 import logging
 import sys
 
-from lake_udf import StageLocation, UDFServer, udf
+from tidbcloudlake_udf import StageLocation, UDFServer, udf
 
 logging.basicConfig(level=logging.INFO)
 

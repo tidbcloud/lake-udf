@@ -13,8 +13,8 @@ import pyarrow as pa
 import pyarrow.flight as fl
 import pytest
 
-from lake_udf import Headers, udf
-from lake_udf.udf import QueryCancelledError
+from tidbcloudlake_udf import Headers, udf
+from tidbcloudlake_udf.udf import QueryCancelledError
 
 
 # =============================================================================

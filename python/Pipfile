@@ -4,7 +4,7 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-databend-udf = {file = "."}
+tidbcloudlake-udf = {file = "."}
 
 [dev-packages]
 ruff = "*"

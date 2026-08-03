@@ -10,7 +10,7 @@ or cancellation is properly propagated to the UDF execution.
 import logging
 import time
 
-from lake_udf import UDFServer, udf
+from tidbcloudlake_udf import UDFServer, udf
 
 logging.basicConfig(level=logging.INFO)
 

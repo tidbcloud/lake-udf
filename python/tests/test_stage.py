@@ -11,8 +11,8 @@ import json
 import pyarrow as pa
 import pytest
 
-from lake_udf import StageLocation, UDFClient, udf
-from lake_udf.udf import Headers
+from tidbcloudlake_udf import StageLocation, UDFClient, udf
+from tidbcloudlake_udf.udf import Headers
 
 
 # =============================================================================
@@ -67,7 +67,7 @@ def _gcs_stage(param_name: str, bucket: str, path: str, stage_name: str = None) 
                     "credential": json.dumps(
                         {
                             "type": "service_account",
-                            "client_email": "udf@databend.dev",
+                            "client_email": "udf@example.com",
                             "private_key": "-----BEGIN PRIVATE KEY-----",
                         }
                     ),

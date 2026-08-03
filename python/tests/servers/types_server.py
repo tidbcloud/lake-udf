@@ -11,7 +11,7 @@ import logging
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
-from lake_udf import UDFServer, udf
+from tidbcloudlake_udf import UDFServer, udf
 
 logging.basicConfig(level=logging.INFO)
 

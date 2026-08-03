@@ -9,7 +9,7 @@ import sys
 import time
 import os
 import socket
-from lake_udf import UDFClient
+from tidbcloudlake_udf import UDFClient
 
 
 def find_free_port():

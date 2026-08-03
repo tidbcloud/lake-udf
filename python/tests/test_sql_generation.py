@@ -1,7 +1,7 @@
 import logging
 import pyarrow as pa
 from prometheus_client import REGISTRY
-from lake_udf import udf, StageLocation, UDFServer
+from tidbcloudlake_udf import udf, StageLocation, UDFServer
 
 
 @udf(input_types=["INT"], result_type="INT")

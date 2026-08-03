@@ -61,7 +61,7 @@ jobs:
       id-token: write
     environment:
       name: pypi.org
-      url: https://pypi.org/p/lake-udf/
+      url: https://pypi.org/p/tidbcloudlake-udf/
     steps:
       - uses: actions/checkout@v4
       - name: Build package

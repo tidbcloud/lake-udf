@@ -12,8 +12,8 @@ from decimal import Decimal
 
 import pyarrow as pa
 
-from lake_udf import Headers, udf
-from lake_udf.udf import (
+from tidbcloudlake_udf import Headers, udf
+from tidbcloudlake_udf.udf import (
     _type_str_to_arrow_field,
     _field_type_to_string,
     _input_process_func,

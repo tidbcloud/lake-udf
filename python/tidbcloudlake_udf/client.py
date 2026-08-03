@@ -7,6 +7,7 @@ import pyarrow as pa
 import pyarrow.flight as fl
 
 
+# Wire protocol -- fixed by the query engine, not a brand name to rebrand.
 _SCHEMA_METADATA_INPUT_COUNT_KEY = b"x-databend-udf-input-count"
 
 
@@ -175,7 +176,7 @@ class UDFClient:
 
     @staticmethod
     def format_stage_mapping(stage_locations: Iterable[Dict[str, Any]]) -> str:
-        """Serialize stage mapping entries to the Databend header payload."""
+        """Serialize stage mapping entries into the header payload."""
 
         serialized_entries: List[Dict[str, Any]] = []
         for entry in stage_locations:
@@ -195,7 +196,7 @@ class UDFClient:
         """Construct Flight headers for a UDF call.
 
         ``stage_locations`` becomes a single header named ``databend-stage-mapping``
-        whose value is a JSON array. This mirrors what Databend Query sends to
+        whose value is a JSON array. This mirrors what the query engine sends to
         external UDF servers. Example HTTP-style representation::
 
             databend-stage-mapping: [

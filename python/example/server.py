@@ -18,7 +18,7 @@ from decimal import Decimal
 import time
 from typing import List, Dict, Any, Tuple, Optional
 
-from lake_udf import udf, UDFServer
+from tidbcloudlake_udf import udf, UDFServer
 # from test import udf, UDFServer
 
 logging.basicConfig(level=logging.INFO)

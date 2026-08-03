@@ -5,7 +5,7 @@ Only includes built-in functions.
 """
 
 import logging
-from lake_udf import UDFServer
+from tidbcloudlake_udf import UDFServer
 
 logging.basicConfig(level=logging.INFO)
 

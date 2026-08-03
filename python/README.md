@@ -5,7 +5,7 @@ Write user-defined functions in Python for TiDB Cloud Lake.
 ## Quick Start
 
 ```python
-from lake_udf import udf, UDFServer
+from tidbcloudlake_udf import udf, UDFServer
 
 @udf(input_types=["INT", "INT"], result_type="INT")
 def add(a: int, b: int) -> int:
@@ -61,7 +61,7 @@ SELECT add(1, 2);  -- 3
 ### Basic Types
 
 ```python
-from lake_udf import udf
+from tidbcloudlake_udf import udf
 import datetime
 from decimal import Decimal
 
@@ -165,7 +165,7 @@ def fetch_data(id: int) -> int:
 To protect your UDF server from being overwhelmed, use `max_concurrency` to limit the number of concurrent requests per function:
 
 ```python
-from lake_udf import udf, UDFServer
+from tidbcloudlake_udf import udf, UDFServer
 
 @udf(input_types=["INT"], result_type="INT", max_concurrency=10)
 def expensive_operation(x: int) -> int:
@@ -242,7 +242,7 @@ Format code with Ruff:
 
 ```bash
 pip install ruff
-ruff format python/lake_udf python/tests
+ruff format python/tidbcloudlake_udf python/tests
 ```
 
 ---

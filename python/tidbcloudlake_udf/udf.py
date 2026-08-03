@@ -45,7 +45,7 @@ from pyarrow.flight import (
     ServerMiddlewareFactory,
 )
 
-# comes from Databend
+# comes from the query engine
 MAX_DECIMAL128_PRECISION = 38
 MAX_DECIMAL256_PRECISION = 76
 EXTENSION_KEY = b"Extension"
@@ -54,6 +54,11 @@ ARROW_EXT_TYPE_VECTOR = b"Vector"
 
 
 TIMESTAMP_UINT = "us"
+
+# Wire protocol. The query engine sends these header and metadata keys verbatim
+# (see HEADER_TENANT / HEADER_QUERY_ID and the `databend-stage-mapping` header it
+# builds for UDF calls), so the names below are fixed by the server and must not
+# be rebranded.
 _SCHEMA_METADATA_INPUT_COUNT_KEY = b"x-databend-udf-input-count"
 
 logger = logging.getLogger(__name__)
@@ -142,7 +147,7 @@ def _extract_param_name(entry: Dict[str, Any]) -> Optional[str]:
 
 @dataclass
 class StageLocation:
-    """Structured representation of a stage argument resolved by Databend."""
+    """Structured representation of a stage argument resolved by the query engine."""
 
     name: str
     stage_name: str
@@ -295,7 +300,7 @@ def _load_stage_mapping(header_value: Any) -> Dict[str, StageLocation]:
           }
         ]
 
-    ``stage_info`` is the JSON form of Databend's ``StageInfo`` structure and is
+    ``stage_info`` is the JSON form of the query engine's ``StageInfo`` structure and is
     forwarded verbatim so UDF handlers can access any extended metadata.
     """
     if header_value is None:
@@ -322,7 +327,7 @@ def _load_stage_mapping(header_value: Any) -> Dict[str, StageLocation]:
 
 
 class Headers:
-    """Wrapper providing convenient accessors for Databend request headers."""
+    """Wrapper providing convenient accessors for query engine request headers."""
 
     def __init__(
         self, headers: Optional[Dict[str, Any]] = None, context: Any = None
@@ -1020,7 +1025,7 @@ def udf(
     Parameters:
     - input_types: describe each argument's type.
     - result_type: single type or column list describing the result(s).
-    - name: optional function name exposed to Databend.
+    - name: optional function name exposed to the query engine.
     - stage_refs: optional list of parameter names treated as stage locations.
     - io_threads: number of threads for IO bound scalar functions.
     - skip_null: when True, NULL inputs bypass the function and yield NULL output.
@@ -1477,7 +1482,7 @@ def _type_str_to_arrow_field_inner(type_str: str) -> pa.Field:
     elif type_str in ("BINARY"):
         return pa.field("", pa.large_binary(), False)
     elif type_str in ("VARIANT", "JSON"):
-        # In Databend, JSON type is identified by the "EXTENSION" key in the metadata.
+        # In TiDB Cloud Lake, JSON type is identified by the "EXTENSION" key in the metadata.
         return pa.field(
             "",
             pa.large_binary(),
@@ -1553,7 +1558,7 @@ def _arrow_field_to_string(field: pa.Field) -> str:
 
 
 def _inner_field_to_string(field: pa.Field) -> str:
-    # inner field default is NOT NULL in databend
+    # inner field default is NOT NULL in the query engine
     type_str = _field_type_to_string(field)
     return f"{type_str} NOT NULL" if not field.nullable else type_str
 
