@@ -46,10 +46,39 @@ server = UDFServer(
 server.serve()
 ```
 
-The advertised `CREATE FUNCTION` DDL then uses `https://`. TLS material given
-with the default plaintext scheme is rejected at startup instead of being
-silently ignored, so a server cannot keep serving cleartext while its operator
-believes it is encrypted.
+The advertised `CREATE FUNCTION` DDL then uses `https://`.
+
+### Upgrade note: plaintext + TLS material used to be silent
+
+Previous releases hardcoded the plaintext `grpc://` scheme, so passing
+`tls_certificates=` (or `verify_client=`) while keeping the default location
+started a **plaintext** listener with no warning. This release keeps that
+configuration starting — so an upgrade cannot turn a pre-existing
+misconfiguration into a crash loop — but logs a loud warning:
+
+```
+UDF server is serving Flight over PLAINTEXT: the transport scheme is 'grpc',
+so the TLS options (tls_certificates) are being IGNORED and traffic is not
+encrypted. Pass scheme='grpc+tls' ... or pass require_tls=True / set
+TIDBCLOUDLAKE_UDF_REQUIRE_TLS=1 to make this a startup error.
+```
+
+If traffic really is unencrypted, fix the configuration by adding
+`scheme="grpc+tls"`. If you want the SDK to refuse to start instead of warning,
+opt into strict mode:
+
+```python
+server = UDFServer("0.0.0.0:8815", scheme="grpc+tls", tls_certificates=..., require_tls=True)
+```
+
+or set the environment variable for the whole deployment:
+
+```bash
+export TIDBCLOUDLAKE_UDF_REQUIRE_TLS=1
+```
+
+In strict mode a plaintext scheme (`grpc`, with or without TLS options) raises
+`ValueError` at construction time. The `grpc+tls` path is unaffected.
 
 The client mirrors the same options:
 
@@ -60,6 +89,19 @@ client = UDFClient(
     "udf-server.internal", 8815, scheme="grpc+tls", tls_root_certs=ca_pem
 )
 ```
+
+`UDFClient(..., require_tls=True)` refuses to connect over plaintext; the
+default still allows plaintext (with a warning if TLS options were supplied),
+matching previous releases.
+
+### Certificates on the engine side
+
+When the advertised `ADDRESS` is `https://`, the query engine validates the
+server certificate against the engine's system root CAs. A self-signed
+certificate therefore makes `CREATE FUNCTION` fail with a TLS verification
+error; use a certificate issued by a CA that the engine trusts, or install your
+CA into the engine's trust store. `verify_client=True` (mTLS) additionally
+requires the engine to present a client certificate.
 
 TLS protects data in transit, but it does not by itself authenticate callers or
 verify the `x-databend-tenant` header. Enable `verify_client` (mTLS) or pass a
@@ -289,6 +331,28 @@ udf_server_allow_list = ["http://0.0.0.0:8815"]
 - [Type Test Cases](tests/test_types.py) - How types are encoded/decoded and used in UDFs
 - [UDF Usage Examples](tests/test_udf.py) - Scalar and table UDF usage patterns
 - [Server Usage](tests/test_server.py) - Starting a UDF server and basic connectivity
+
+## Release Notes
+
+### 0.3.0
+
+- **Transport security is configurable end to end.** `UDFServer` accepts
+  `scheme="grpc+tls"` (or a `grpc+tls://host:port` location) together with
+  `tls_certificates`, `verify_client` and `root_certificates`; `UDFClient`
+  accepts `scheme`, `tls_root_certs`, `cert_chain`, `private_key`,
+  `disable_server_verification` and `override_hostname`. Previously both sides
+  hardcoded `grpc://`, so TLS was unreachable and TLS options were silently
+  ignored. The advertised `CREATE FUNCTION` DDL now uses `https://` when
+  serving over TLS.
+- **New `require_tls` strict mode** on `UDFServer` (and `UDFClient`), plus the
+  `TIDBCLOUDLAKE_UDF_REQUIRE_TLS` environment variable, to refuse plaintext
+  instead of only warning.
+- **Request-size bounds:** `UDFServer(max_batch_rows=1_000_000)` rejects
+  inbound batches that declare more rows than the bound, and per-row work is
+  submitted in windows sized to `io_threads` instead of one future per row.
+- **Upgrade behaviour:** a plaintext scheme combined with TLS material keeps
+  starting (as in previous releases) but logs a warning; it no longer serves
+  that combination silently. See the Transport Security section above.
 
 ## Development
 

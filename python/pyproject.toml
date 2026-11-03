@@ -7,7 +7,7 @@ classifiers = [
 description = "TiDB Cloud Lake UDF Server"
 license = { text = "Apache-2.0" }
 name = "tidbcloudlake-udf"
-version = "0.2.20"
+version = "0.3.0"
 readme = "README.md"
 requires-python = ">=3.7"
 dependencies = [
