@@ -61,7 +61,51 @@ TIMESTAMP_UINT = "us"
 # be rebranded.
 _SCHEMA_METADATA_INPUT_COUNT_KEY = b"x-databend-udf-input-count"
 
+# Arrow Flight transport schemes. pyarrow picks the transport security of both
+# the server and the client from the *URI scheme*: ``grpc://`` is plaintext and
+# ``grpc+tls://`` is TLS. TLS material handed to a plaintext location is
+# silently ignored by pyarrow, so the scheme must be explicit and consistent.
+PLAINTEXT_SCHEME = "grpc"
+TLS_SCHEME = "grpc+tls"
+_SUPPORTED_SCHEMES = (PLAINTEXT_SCHEME, TLS_SCHEME)
+
+# TLS-related kwargs accepted by ``pyarrow.flight.FlightServerBase``.
+_TLS_SERVER_KWARGS = ("tls_certificates", "root_certificates", "verify_client")
+
 logger = logging.getLogger(__name__)
+
+
+def _split_location(location: str) -> Tuple[str, str]:
+    """Split an optional ``scheme://`` prefix off a ``host:port`` location."""
+    if "://" in location:
+        scheme, _, address = location.partition("://")
+        return scheme, address
+    return "", location
+
+
+def _normalize_scheme(scheme: str) -> str:
+    scheme = scheme.lower()
+    if scheme not in _SUPPORTED_SCHEMES:
+        raise ValueError(
+            f"Unsupported transport scheme {scheme!r}; expected one of {_SUPPORTED_SCHEMES}"
+        )
+    return scheme
+
+
+def _build_create_function_sql(
+    name: str, input_types: str, output_type: str, location: str, scheme: str
+) -> str:
+    """Build the CREATE FUNCTION DDL advertised for a registered function.
+
+    The address scheme follows the transport scheme so the query engine does
+    not keep talking plaintext to a TLS-only server.
+    """
+    address_scheme = "https" if scheme == TLS_SCHEME else "http"
+    return (
+        f"CREATE OR REPLACE FUNCTION {name} ({input_types}) "
+        f"RETURNS {output_type} LANGUAGE python "
+        f"HANDLER = '{name}' ADDRESS = '{address_scheme}://{location}';"
+    )
 
 
 class QueryState:
@@ -1102,18 +1146,51 @@ class UDFServer(FlightServerBase):
     server.add_function(my_udf)
     server.serve()
     ```
+
+    Transport security is selected by ``scheme`` (``"grpc"``, the default, or
+    ``"grpc+tls"``) or by passing an explicit ``grpc://``/``grpc+tls://``
+    location. When ``scheme="grpc+tls"`` the TLS material is passed through to
+    pyarrow, e.g.::
+
+        UDFServer(
+            location="0.0.0.0:8815",
+            scheme="grpc+tls",
+            tls_certificates=[(cert_pem, key_pem)],
+            verify_client=True,
+            root_certificates=ca_pem,
+        )
     """
 
     _location: str
+    _scheme: str
     _functions: Dict[str, UserDefinedFunction]
 
-    def __init__(self, location="0.0.0.0:8815", metric_location=None, **kwargs):
+    def __init__(
+        self,
+        location="0.0.0.0:8815",
+        metric_location=None,
+        scheme: Optional[str] = None,
+        **kwargs,
+    ):
+        location_scheme, address = _split_location(location)
+        if location_scheme and scheme is not None:
+            if _normalize_scheme(location_scheme) != _normalize_scheme(scheme):
+                raise ValueError(
+                    f"Conflicting transport schemes: location specifies {location_scheme!r} "
+                    f"but scheme={scheme!r}"
+                )
+        resolved_scheme = _normalize_scheme(
+            location_scheme or scheme or PLAINTEXT_SCHEME
+        )
+        self._check_transport_security(resolved_scheme, kwargs)
+
         middleware = dict(kwargs.pop("middleware", {}))
         middleware.setdefault("log_headers", HeadersMiddlewareFactory())
         super(UDFServer, self).__init__(
-            "grpc://" + location, middleware=middleware, **kwargs
+            f"{resolved_scheme}://{address}", middleware=middleware, **kwargs
         )
-        self._location = location
+        self._scheme = resolved_scheme
+        self._location = address
         self._metric_location = metric_location
         self._functions = {}
 
@@ -1172,6 +1249,33 @@ class UDFServer(FlightServerBase):
 
         self.add_function(builtin_echo)
         self.add_function(builtin_healthy)
+
+    @staticmethod
+    def _check_transport_security(scheme: str, kwargs: Mapping[str, Any]) -> None:
+        """Reject configurations where TLS material would be silently ignored.
+
+        pyarrow derives the transport security from the location scheme, so a
+        plaintext ``grpc://`` location makes it drop ``tls_certificates`` /
+        ``verify_client`` / ``root_certificates`` and keep serving cleartext
+        with no error. Failing fast is the only way an operator learns that the
+        server they believe is encrypted is not.
+        """
+        tls_material = [name for name in _TLS_SERVER_KWARGS if kwargs.get(name)]
+        if scheme == TLS_SCHEME:
+            if not kwargs.get("tls_certificates"):
+                raise ValueError(
+                    "scheme='grpc+tls' requires tls_certificates=[(cert_pem, key_pem)]"
+                )
+        elif tls_material:
+            raise ValueError(
+                "TLS options "
+                + ", ".join(tls_material)
+                + " were provided but the transport scheme is 'grpc', which is "
+                "plaintext; pyarrow would ignore them silently. Pass "
+                "scheme='grpc+tls' (or an explicit 'grpc+tls://host:port' "
+                "location) and tls_certificates=[(cert_pem, key_pem)] to serve "
+                "over TLS."
+            )
 
     def _start_metrics_server(self):
         """Start Prometheus metrics HTTP server if metric_location is provided"""
@@ -1287,10 +1391,8 @@ class UDFServer(FlightServerBase):
             output_type = f"TABLE ({column_defs})"
         else:
             output_type = _arrow_field_to_string(udf._result_schema[0])
-        sql = (
-            f"CREATE OR REPLACE FUNCTION {name} ({input_types}) "
-            f"RETURNS {output_type} LANGUAGE python "
-            f"HANDLER = '{name}' ADDRESS = 'http://{self._location}';"
+        sql = _build_create_function_sql(
+            name, input_types, output_type, self._location, self._scheme
         )
         logger.info(f"added function: {name}, SQL:\n{sql}\n")
 

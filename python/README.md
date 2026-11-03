@@ -28,6 +28,43 @@ LANGUAGE python HANDLER = 'add' ADDRESS = 'http://0.0.0.0:8815';
 SELECT add(1, 2);  -- 3
 ```
 
+## Transport Security (TLS)
+
+The transport scheme is configurable. It defaults to plaintext `grpc://` for
+backward compatibility; pass `scheme="grpc+tls"` (or a full
+`grpc+tls://host:port` location) to serve over TLS:
+
+```python
+server = UDFServer(
+    "0.0.0.0:8815",
+    scheme="grpc+tls",
+    tls_certificates=[(cert_pem, key_pem)],
+    # Optional mutual TLS:
+    verify_client=True,
+    root_certificates=ca_pem,
+)
+server.serve()
+```
+
+The advertised `CREATE FUNCTION` DDL then uses `https://`. TLS material given
+with the default plaintext scheme is rejected at startup instead of being
+silently ignored, so a server cannot keep serving cleartext while its operator
+believes it is encrypted.
+
+The client mirrors the same options:
+
+```python
+from tidbcloudlake_udf import UDFClient
+
+client = UDFClient(
+    "udf-server.internal", 8815, scheme="grpc+tls", tls_root_certs=ca_pem
+)
+```
+
+TLS protects data in transit, but it does not by itself authenticate callers or
+verify the `x-databend-tenant` header. Enable `verify_client` (mTLS) or pass a
+pyarrow `auth_handler` when the endpoint is reachable by untrusted peers.
+
 ## Data Types
 
 | SQL Type     | Python Type       | Example                    |
