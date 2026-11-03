@@ -15,6 +15,7 @@
 import json
 import logging
 import inspect
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -73,6 +74,14 @@ _SUPPORTED_SCHEMES = (PLAINTEXT_SCHEME, TLS_SCHEME)
 # TLS-related kwargs accepted by ``pyarrow.flight.FlightServerBase``.
 _TLS_SERVER_KWARGS = ("tls_certificates", "root_certificates", "verify_client")
 
+# Opt-in strict transport security. TLS material handed to a plaintext location
+# used to be silently ignored by pyarrow; failing hard at construction time would
+# turn that (pre-existing) misconfiguration into a crash loop on upgrade, so the
+# default is a loud runtime warning. Setting this environment variable to a
+# truthy value (or passing ``require_tls=True``) refuses to serve plaintext.
+REQUIRE_TLS_ENV_VAR = "TIDBCLOUDLAKE_UDF_REQUIRE_TLS"
+_TRUTHY_ENV_VALUES = ("1", "true", "yes", "on")
+
 # Upper bound on the number of rows a single inbound RecordBatch may declare.
 # ``RecordBatch.num_rows`` is plain IPC metadata: a batch whose columns carry no
 # buffers at all (e.g. a Null-typed or zero-column batch) can declare billions of
@@ -101,6 +110,14 @@ def _normalize_scheme(scheme: str) -> str:
             f"Unsupported transport scheme {scheme!r}; expected one of {_SUPPORTED_SCHEMES}"
         )
     return scheme
+
+
+def _resolve_require_tls(require_tls: Optional[bool]) -> bool:
+    """Resolve the strict-transport flag, falling back to the environment."""
+    if require_tls is not None:
+        return bool(require_tls)
+    value = os.environ.get(REQUIRE_TLS_ENV_VAR)
+    return value is not None and value.strip().lower() in _TRUTHY_ENV_VALUES
 
 
 def _build_create_function_sql(
@@ -1180,10 +1197,17 @@ class UDFServer(FlightServerBase):
 
     ``max_batch_rows`` bounds the row count an inbound RecordBatch may declare
     (default ``DEFAULT_MAX_BATCH_ROWS``); pass ``None`` to disable the bound.
+
+    ``require_tls`` opts into strict transport security: with
+    ``require_tls=True`` (or ``TIDBCLOUDLAKE_UDF_REQUIRE_TLS=1``) a plaintext
+    ``grpc`` scheme is refused instead of warning. The default is ``False`` so
+    that deployments which used to serve plaintext with TLS options keep
+    starting (with a warning) after upgrading.
     """
 
     _location: str
     _scheme: str
+    _require_tls: bool
     _max_batch_rows: Optional[int]
     _functions: Dict[str, UserDefinedFunction]
 
@@ -1193,6 +1217,7 @@ class UDFServer(FlightServerBase):
         metric_location=None,
         scheme: Optional[str] = None,
         max_batch_rows: Optional[int] = DEFAULT_MAX_BATCH_ROWS,
+        require_tls: Optional[bool] = None,
         **kwargs,
     ):
         location_scheme, address = _split_location(location)
@@ -1205,7 +1230,8 @@ class UDFServer(FlightServerBase):
         resolved_scheme = _normalize_scheme(
             location_scheme or scheme or PLAINTEXT_SCHEME
         )
-        self._check_transport_security(resolved_scheme, kwargs)
+        self._require_tls = _resolve_require_tls(require_tls)
+        self._check_transport_security(resolved_scheme, kwargs, self._require_tls)
         if max_batch_rows is not None:
             if not isinstance(max_batch_rows, int) or max_batch_rows <= 0:
                 raise ValueError(
@@ -1281,14 +1307,18 @@ class UDFServer(FlightServerBase):
         self.add_function(builtin_healthy)
 
     @staticmethod
-    def _check_transport_security(scheme: str, kwargs: Mapping[str, Any]) -> None:
-        """Reject configurations where TLS material would be silently ignored.
+    def _check_transport_security(
+        scheme: str, kwargs: Mapping[str, Any], require_tls: bool = False
+    ) -> None:
+        """Fail (strict mode) or warn when the served transport is plaintext.
 
         pyarrow derives the transport security from the location scheme, so a
         plaintext ``grpc://`` location makes it drop ``tls_certificates`` /
         ``verify_client`` / ``root_certificates`` and keep serving cleartext
-        with no error. Failing fast is the only way an operator learns that the
-        server they believe is encrypted is not.
+        with no error. Because previous releases behaved this way silently, the
+        default is a loud warning so an upgrade does not turn a pre-existing
+        misconfiguration into a crash loop; pass ``require_tls=True`` (or set
+        ``TIDBCLOUDLAKE_UDF_REQUIRE_TLS=1``) to refuse to start instead.
         """
         tls_material = [name for name in _TLS_SERVER_KWARGS if kwargs.get(name)]
         if scheme == TLS_SCHEME:
@@ -1296,15 +1326,25 @@ class UDFServer(FlightServerBase):
                 raise ValueError(
                     "scheme='grpc+tls' requires tls_certificates=[(cert_pem, key_pem)]"
                 )
-        elif tls_material:
+            return
+        if require_tls:
             raise ValueError(
-                "TLS options "
-                + ", ".join(tls_material)
-                + " were provided but the transport scheme is 'grpc', which is "
-                "plaintext; pyarrow would ignore them silently. Pass "
-                "scheme='grpc+tls' (or an explicit 'grpc+tls://host:port' "
-                "location) and tls_certificates=[(cert_pem, key_pem)] to serve "
-                "over TLS."
+                "require_tls is enabled (require_tls=True or "
+                f"{REQUIRE_TLS_ENV_VAR}=1) but the transport scheme is 'grpc', "
+                "which is plaintext. Pass scheme='grpc+tls' (or an explicit "
+                "'grpc+tls://host:port' location) with "
+                "tls_certificates=[(cert_pem, key_pem)] to serve over TLS, or "
+                "drop the strict flag to serve plaintext with a warning."
+            )
+        if tls_material:
+            logger.warning(
+                "UDF server is serving Flight over PLAINTEXT: the transport scheme "
+                "is 'grpc', so the TLS options (%s) are being IGNORED and traffic "
+                "is not encrypted. Pass scheme='grpc+tls' with "
+                "tls_certificates=[(cert_pem, key_pem)] to serve over TLS, or pass "
+                "require_tls=True / set %s=1 to make this a startup error.",
+                ", ".join(tls_material),
+                REQUIRE_TLS_ENV_VAR,
             )
 
     def _start_metrics_server(self):

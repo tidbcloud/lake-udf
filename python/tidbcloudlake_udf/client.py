@@ -1,6 +1,7 @@
 """Simple client library for testing TiDB Cloud Lake UDF servers."""
 
 import json
+import logging
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import pyarrow as pa
@@ -17,6 +18,8 @@ PLAINTEXT_SCHEME = "grpc"
 TLS_SCHEME = "grpc+tls"
 _SUPPORTED_SCHEMES = (PLAINTEXT_SCHEME, TLS_SCHEME)
 
+logger = logging.getLogger(__name__)
+
 
 class UDFClient:
     """Simple client for calling UDF functions on a TiDB Cloud Lake UDF server."""
@@ -31,6 +34,7 @@ class UDFClient:
         private_key: bytes = None,
         disable_server_verification: bool = None,
         override_hostname: str = None,
+        require_tls: bool = False,
     ):
         """
         Initialize UDF client.
@@ -46,6 +50,9 @@ class UDFClient:
             private_key: PEM-encoded client private key, for mutual TLS.
             disable_server_verification: Skip server certificate verification.
             override_hostname: Override the hostname checked by TLS.
+            require_tls: Refuse to connect over plaintext. Defaults to False,
+                matching previous releases, which allows plaintext with a
+                warning when TLS options are supplied.
         """
         scheme = scheme.lower()
         if scheme not in _SUPPORTED_SCHEMES:
@@ -62,14 +69,21 @@ class UDFClient:
         tls_options = {
             key: value for key, value in tls_options.items() if value is not None
         }
-        if scheme == PLAINTEXT_SCHEME and tls_options:
-            raise ValueError(
-                "TLS options "
-                + ", ".join(sorted(tls_options))
-                + " were provided but the transport scheme is 'grpc', which is "
-                "plaintext; pyarrow would ignore them silently. Pass "
-                "scheme='grpc+tls' to connect over TLS."
-            )
+        if scheme == PLAINTEXT_SCHEME:
+            if require_tls:
+                raise ValueError(
+                    "require_tls=True but the transport scheme is 'grpc', which is "
+                    "plaintext. Pass scheme='grpc+tls' to connect over TLS."
+                )
+            if tls_options:
+                logger.warning(
+                    "UDF client is connecting over PLAINTEXT: the transport scheme "
+                    "is 'grpc', so the TLS options (%s) are being IGNORED and traffic "
+                    "is not encrypted. Pass scheme='grpc+tls' to connect over TLS, "
+                    "or require_tls=True to make this an error.",
+                    ", ".join(sorted(tls_options)),
+                )
+                tls_options = {}
         self.scheme = scheme
         self.location = f"{scheme}://{host}:{port}"
         self.client = fl.FlightClient(self.location, **tls_options)
