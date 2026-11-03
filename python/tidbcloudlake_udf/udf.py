@@ -16,6 +16,7 @@ import json
 import logging
 import inspect
 import time
+from collections import deque
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from threading import Semaphore
@@ -71,6 +72,16 @@ _SUPPORTED_SCHEMES = (PLAINTEXT_SCHEME, TLS_SCHEME)
 
 # TLS-related kwargs accepted by ``pyarrow.flight.FlightServerBase``.
 _TLS_SERVER_KWARGS = ("tls_certificates", "root_certificates", "verify_client")
+
+# Upper bound on the number of rows a single inbound RecordBatch may declare.
+# ``RecordBatch.num_rows`` is plain IPC metadata: a batch whose columns carry no
+# buffers at all (e.g. a Null-typed or zero-column batch) can declare billions of
+# rows in a few hundred bytes, so nothing else in the request path bounds the
+# per-row work and allocation that number drives. The default leaves >100x
+# headroom over the query engine's usual block size (thousands of rows) while
+# keeping worst-case per-batch allocation bounded; set ``max_batch_rows=None``
+# to restore the previous unbounded behaviour.
+DEFAULT_MAX_BATCH_ROWS = 1_000_000
 
 logger = logging.getLogger(__name__)
 
@@ -741,8 +752,12 @@ class ScalarFunction(CallableFunction):
             elif self._executor is not None:
                 row_count = batch.num_rows
                 column = [None] * row_count
-                futures = []
-                future_rows: List[int] = []
+                # Bound the number of in-flight tasks. Submitting one future per
+                # caller-declared row up front makes queue memory -- and thread
+                # contention -- grow with the row count instead of with the pool
+                # size, which is exactly the amplifier an untrusted peer needs.
+                max_in_flight = max(1, self._io_threads or 1)
+                pending = deque()
                 for row in range(row_count):
                     if headers_obj.query_state.is_cancelled():
                         raise QueryCancelledError("Query cancelled")
@@ -752,12 +767,15 @@ class ScalarFunction(CallableFunction):
                     call_args = self._assemble_args(
                         processed_inputs, stage_locations, headers_obj, row
                     )
-                    futures.append(self._executor.submit(self._func, *call_args))
-                    future_rows.append(row)
-                for row, future in zip(future_rows, futures):
+                    pending.append((row, self._executor.submit(self._func, *call_args)))
+                    if len(pending) >= max_in_flight:
+                        done_row, done_future = pending.popleft()
+                        column[done_row] = done_future.result()
+                while pending:
                     if headers_obj.query_state.is_cancelled():
                         raise QueryCancelledError("Query cancelled")
-                    column[row] = future.result()
+                    done_row, done_future = pending.popleft()
+                    column[done_row] = done_future.result()
             else:
                 column = []
                 for row in range(batch.num_rows):
@@ -1159,10 +1177,14 @@ class UDFServer(FlightServerBase):
             verify_client=True,
             root_certificates=ca_pem,
         )
+
+    ``max_batch_rows`` bounds the row count an inbound RecordBatch may declare
+    (default ``DEFAULT_MAX_BATCH_ROWS``); pass ``None`` to disable the bound.
     """
 
     _location: str
     _scheme: str
+    _max_batch_rows: Optional[int]
     _functions: Dict[str, UserDefinedFunction]
 
     def __init__(
@@ -1170,6 +1192,7 @@ class UDFServer(FlightServerBase):
         location="0.0.0.0:8815",
         metric_location=None,
         scheme: Optional[str] = None,
+        max_batch_rows: Optional[int] = DEFAULT_MAX_BATCH_ROWS,
         **kwargs,
     ):
         location_scheme, address = _split_location(location)
@@ -1183,6 +1206,13 @@ class UDFServer(FlightServerBase):
             location_scheme or scheme or PLAINTEXT_SCHEME
         )
         self._check_transport_security(resolved_scheme, kwargs)
+        if max_batch_rows is not None:
+            if not isinstance(max_batch_rows, int) or max_batch_rows <= 0:
+                raise ValueError(
+                    "max_batch_rows must be a positive integer or None, got "
+                    f"{max_batch_rows!r}"
+                )
+        self._max_batch_rows = max_batch_rows
 
         middleware = dict(kwargs.pop("middleware", {}))
         middleware.setdefault("log_headers", HeadersMiddlewareFactory())
@@ -1339,6 +1369,11 @@ class UDFServer(FlightServerBase):
         try:
             with self.response_duration.labels(function_name=func_name).time():
                 for batch in reader:
+                    # Reject batches whose caller-declared row count exceeds the
+                    # configured bound before any per-row allocation or task
+                    # submission happens.
+                    self._check_batch_size(func_name, batch.data.num_rows)
+
                     # Update row metrics
                     batch_rows = batch.data.num_rows
                     self.rows_count.labels(function_name=func_name).inc(batch_rows)
@@ -1406,6 +1441,16 @@ class UDFServer(FlightServerBase):
             )
 
         super(UDFServer, self).serve()
+
+    def _check_batch_size(self, func_name: str, num_rows: int) -> None:
+        """Reject a batch that declares more rows than the configured bound."""
+        if self._max_batch_rows is not None and num_rows > self._max_batch_rows:
+            raise ValueError(
+                f"Function '{func_name}' rejected a batch of {num_rows} rows: "
+                f"max_batch_rows is {self._max_batch_rows}. Split the input into "
+                "smaller batches or raise max_batch_rows on the server if larger "
+                "batches are expected."
+            )
 
 
 def _input_process_func(field: pa.Field) -> Callable:

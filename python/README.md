@@ -241,6 +241,23 @@ def api_call(id: int) -> int:
     return fetch_from_api(id)
 ```
 
+### Request Size Limits
+
+`UDFServer` rejects an inbound RecordBatch that declares more than
+`max_batch_rows` rows (default `1_000_000`) before doing any per-row work. The
+row count of a RecordBatch is metadata: a batch with no buffers can claim
+billions of rows from a few hundred bytes, so this bound is what keeps a peer
+from driving per-row allocation and task submission. Raise it (or pass `None`
+to disable the bound) only if the query engine is configured to send larger
+batches, and remember that larger batches mean more memory per request:
+
+```python
+server = UDFServer("0.0.0.0:8815", max_batch_rows=4_000_000)
+```
+
+Per-row work is also submitted in windows sized to `io_threads`, so the number
+of in-flight tasks is bounded by the pool size rather than by the row count.
+
 ## Configuration
 
 ### TiDB Cloud Lake Config
