@@ -1,6 +1,7 @@
 """Simple client library for testing TiDB Cloud Lake UDF servers."""
 
 import json
+import logging
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import pyarrow as pa
@@ -10,20 +11,82 @@ import pyarrow.flight as fl
 # Wire protocol -- fixed by the query engine, not a brand name to rebrand.
 _SCHEMA_METADATA_INPUT_COUNT_KEY = b"x-databend-udf-input-count"
 
+# pyarrow selects the transport security from the URI scheme: ``grpc://`` is
+# plaintext, ``grpc+tls://`` is TLS. TLS options passed with a plaintext
+# location are dropped, so the scheme and TLS options must stay consistent.
+PLAINTEXT_SCHEME = "grpc"
+TLS_SCHEME = "grpc+tls"
+_SUPPORTED_SCHEMES = (PLAINTEXT_SCHEME, TLS_SCHEME)
+
+logger = logging.getLogger(__name__)
+
 
 class UDFClient:
     """Simple client for calling UDF functions on a TiDB Cloud Lake UDF server."""
 
-    def __init__(self, host: str = "localhost", port: int = 8815):
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 8815,
+        scheme: str = PLAINTEXT_SCHEME,
+        tls_root_certs: bytes = None,
+        cert_chain: bytes = None,
+        private_key: bytes = None,
+        disable_server_verification: bool = None,
+        override_hostname: str = None,
+        require_tls: bool = False,
+    ):
         """
         Initialize UDF client.
 
         Args:
             host: Server host (default: localhost)
             port: Server port (default: 8815)
+            scheme: Transport scheme, ``"grpc"`` (plaintext, default) or
+                ``"grpc+tls"``.
+            tls_root_certs: PEM-encoded CA certificate(s) used to verify the
+                server when ``scheme="grpc+tls"``.
+            cert_chain: PEM-encoded client certificate, for mutual TLS.
+            private_key: PEM-encoded client private key, for mutual TLS.
+            disable_server_verification: Skip server certificate verification.
+            override_hostname: Override the hostname checked by TLS.
+            require_tls: Refuse to connect over plaintext. Defaults to False,
+                matching previous releases, which allows plaintext with a
+                warning when TLS options are supplied.
         """
-        self.location = f"grpc://{host}:{port}"
-        self.client = fl.FlightClient(self.location)
+        scheme = scheme.lower()
+        if scheme not in _SUPPORTED_SCHEMES:
+            raise ValueError(
+                f"Unsupported transport scheme {scheme!r}; expected one of {_SUPPORTED_SCHEMES}"
+            )
+        tls_options = {
+            "tls_root_certs": tls_root_certs,
+            "cert_chain": cert_chain,
+            "private_key": private_key,
+            "disable_server_verification": disable_server_verification,
+            "override_hostname": override_hostname,
+        }
+        tls_options = {
+            key: value for key, value in tls_options.items() if value is not None
+        }
+        if scheme == PLAINTEXT_SCHEME:
+            if require_tls:
+                raise ValueError(
+                    "require_tls=True but the transport scheme is 'grpc', which is "
+                    "plaintext. Pass scheme='grpc+tls' to connect over TLS."
+                )
+            if tls_options:
+                logger.warning(
+                    "UDF client is connecting over PLAINTEXT: the transport scheme "
+                    "is 'grpc', so the TLS options (%s) are being IGNORED and traffic "
+                    "is not encrypted. Pass scheme='grpc+tls' to connect over TLS, "
+                    "or require_tls=True to make this an error.",
+                    ", ".join(sorted(tls_options)),
+                )
+                tls_options = {}
+        self.scheme = scheme
+        self.location = f"{scheme}://{host}:{port}"
+        self.client = fl.FlightClient(self.location, **tls_options)
         self._schema_cache = {}
 
     def _get_cached_schema(self, function_name: str) -> pa.Schema:
@@ -355,15 +418,23 @@ class UDFClient:
         return result[0] if result else None
 
 
-def create_client(host: str = "localhost", port: int = 8815) -> UDFClient:
+def create_client(
+    host: str = "localhost",
+    port: int = 8815,
+    scheme: str = PLAINTEXT_SCHEME,
+    **kwargs,
+) -> UDFClient:
     """
     Create a UDF client instance.
 
     Args:
         host: Server host (default: localhost)
         port: Server port (default: 8815)
+        scheme: Transport scheme, ``"grpc"`` (plaintext, default) or ``"grpc+tls"``.
+        **kwargs: TLS options forwarded to :class:`UDFClient`
+            (``tls_root_certs``, ``cert_chain``, ``private_key``, ...).
 
     Returns:
         UDFClient instance
     """
-    return UDFClient(host, port)
+    return UDFClient(host, port, scheme=scheme, **kwargs)

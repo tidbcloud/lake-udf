@@ -15,7 +15,9 @@
 import json
 import logging
 import inspect
+import os
 import time
+from collections import deque
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from threading import Semaphore
@@ -61,7 +63,77 @@ TIMESTAMP_UINT = "us"
 # be rebranded.
 _SCHEMA_METADATA_INPUT_COUNT_KEY = b"x-databend-udf-input-count"
 
+# Arrow Flight transport schemes. pyarrow picks the transport security of both
+# the server and the client from the *URI scheme*: ``grpc://`` is plaintext and
+# ``grpc+tls://`` is TLS. TLS material handed to a plaintext location is
+# silently ignored by pyarrow, so the scheme must be explicit and consistent.
+PLAINTEXT_SCHEME = "grpc"
+TLS_SCHEME = "grpc+tls"
+_SUPPORTED_SCHEMES = (PLAINTEXT_SCHEME, TLS_SCHEME)
+
+# TLS-related kwargs accepted by ``pyarrow.flight.FlightServerBase``.
+_TLS_SERVER_KWARGS = ("tls_certificates", "root_certificates", "verify_client")
+
+# Opt-in strict transport security. TLS material handed to a plaintext location
+# used to be silently ignored by pyarrow; failing hard at construction time would
+# turn that (pre-existing) misconfiguration into a crash loop on upgrade, so the
+# default is a loud runtime warning. Setting this environment variable to a
+# truthy value (or passing ``require_tls=True``) refuses to serve plaintext.
+REQUIRE_TLS_ENV_VAR = "TIDBCLOUDLAKE_UDF_REQUIRE_TLS"
+_TRUTHY_ENV_VALUES = ("1", "true", "yes", "on")
+
+# Upper bound on the number of rows a single inbound RecordBatch may declare.
+# ``RecordBatch.num_rows`` is plain IPC metadata: a batch whose columns carry no
+# buffers at all (e.g. a Null-typed or zero-column batch) can declare billions of
+# rows in a few hundred bytes, so nothing else in the request path bounds the
+# per-row work and allocation that number drives. The default leaves >100x
+# headroom over the query engine's usual block size (thousands of rows) while
+# keeping worst-case per-batch allocation bounded; set ``max_batch_rows=None``
+# to restore the previous unbounded behaviour.
+DEFAULT_MAX_BATCH_ROWS = 1_000_000
+
 logger = logging.getLogger(__name__)
+
+
+def _split_location(location: str) -> Tuple[str, str]:
+    """Split an optional ``scheme://`` prefix off a ``host:port`` location."""
+    if "://" in location:
+        scheme, _, address = location.partition("://")
+        return scheme, address
+    return "", location
+
+
+def _normalize_scheme(scheme: str) -> str:
+    scheme = scheme.lower()
+    if scheme not in _SUPPORTED_SCHEMES:
+        raise ValueError(
+            f"Unsupported transport scheme {scheme!r}; expected one of {_SUPPORTED_SCHEMES}"
+        )
+    return scheme
+
+
+def _resolve_require_tls(require_tls: Optional[bool]) -> bool:
+    """Resolve the strict-transport flag, falling back to the environment."""
+    if require_tls is not None:
+        return bool(require_tls)
+    value = os.environ.get(REQUIRE_TLS_ENV_VAR)
+    return value is not None and value.strip().lower() in _TRUTHY_ENV_VALUES
+
+
+def _build_create_function_sql(
+    name: str, input_types: str, output_type: str, location: str, scheme: str
+) -> str:
+    """Build the CREATE FUNCTION DDL advertised for a registered function.
+
+    The address scheme follows the transport scheme so the query engine does
+    not keep talking plaintext to a TLS-only server.
+    """
+    address_scheme = "https" if scheme == TLS_SCHEME else "http"
+    return (
+        f"CREATE OR REPLACE FUNCTION {name} ({input_types}) "
+        f"RETURNS {output_type} LANGUAGE python "
+        f"HANDLER = '{name}' ADDRESS = '{address_scheme}://{location}';"
+    )
 
 
 class QueryState:
@@ -697,8 +769,12 @@ class ScalarFunction(CallableFunction):
             elif self._executor is not None:
                 row_count = batch.num_rows
                 column = [None] * row_count
-                futures = []
-                future_rows: List[int] = []
+                # Bound the number of in-flight tasks. Submitting one future per
+                # caller-declared row up front makes queue memory -- and thread
+                # contention -- grow with the row count instead of with the pool
+                # size, which is exactly the amplifier an untrusted peer needs.
+                max_in_flight = max(1, self._io_threads or 1)
+                pending = deque()
                 for row in range(row_count):
                     if headers_obj.query_state.is_cancelled():
                         raise QueryCancelledError("Query cancelled")
@@ -708,12 +784,15 @@ class ScalarFunction(CallableFunction):
                     call_args = self._assemble_args(
                         processed_inputs, stage_locations, headers_obj, row
                     )
-                    futures.append(self._executor.submit(self._func, *call_args))
-                    future_rows.append(row)
-                for row, future in zip(future_rows, futures):
+                    pending.append((row, self._executor.submit(self._func, *call_args)))
+                    if len(pending) >= max_in_flight:
+                        done_row, done_future = pending.popleft()
+                        column[done_row] = done_future.result()
+                while pending:
                     if headers_obj.query_state.is_cancelled():
                         raise QueryCancelledError("Query cancelled")
-                    column[row] = future.result()
+                    done_row, done_future = pending.popleft()
+                    column[done_row] = done_future.result()
             else:
                 column = []
                 for row in range(batch.num_rows):
@@ -1102,18 +1181,72 @@ class UDFServer(FlightServerBase):
     server.add_function(my_udf)
     server.serve()
     ```
+
+    Transport security is selected by ``scheme`` (``"grpc"``, the default, or
+    ``"grpc+tls"``) or by passing an explicit ``grpc://``/``grpc+tls://``
+    location. When ``scheme="grpc+tls"`` the TLS material is passed through to
+    pyarrow, e.g.::
+
+        UDFServer(
+            location="0.0.0.0:8815",
+            scheme="grpc+tls",
+            tls_certificates=[(cert_pem, key_pem)],
+            verify_client=True,
+            root_certificates=ca_pem,
+        )
+
+    ``max_batch_rows`` bounds the row count an inbound RecordBatch may declare
+    (default ``DEFAULT_MAX_BATCH_ROWS``); pass ``None`` to disable the bound.
+
+    ``require_tls`` opts into strict transport security: with
+    ``require_tls=True`` (or ``TIDBCLOUDLAKE_UDF_REQUIRE_TLS=1``) a plaintext
+    ``grpc`` scheme is refused instead of warning. The default is ``False`` so
+    that deployments which used to serve plaintext with TLS options keep
+    starting (with a warning) after upgrading.
     """
 
     _location: str
+    _scheme: str
+    _require_tls: bool
+    _max_batch_rows: Optional[int]
     _functions: Dict[str, UserDefinedFunction]
 
-    def __init__(self, location="0.0.0.0:8815", metric_location=None, **kwargs):
+    def __init__(
+        self,
+        location="0.0.0.0:8815",
+        metric_location=None,
+        scheme: Optional[str] = None,
+        max_batch_rows: Optional[int] = DEFAULT_MAX_BATCH_ROWS,
+        require_tls: Optional[bool] = None,
+        **kwargs,
+    ):
+        location_scheme, address = _split_location(location)
+        if location_scheme and scheme is not None:
+            if _normalize_scheme(location_scheme) != _normalize_scheme(scheme):
+                raise ValueError(
+                    f"Conflicting transport schemes: location specifies {location_scheme!r} "
+                    f"but scheme={scheme!r}"
+                )
+        resolved_scheme = _normalize_scheme(
+            location_scheme or scheme or PLAINTEXT_SCHEME
+        )
+        self._require_tls = _resolve_require_tls(require_tls)
+        self._check_transport_security(resolved_scheme, kwargs, self._require_tls)
+        if max_batch_rows is not None:
+            if not isinstance(max_batch_rows, int) or max_batch_rows <= 0:
+                raise ValueError(
+                    "max_batch_rows must be a positive integer or None, got "
+                    f"{max_batch_rows!r}"
+                )
+        self._max_batch_rows = max_batch_rows
+
         middleware = dict(kwargs.pop("middleware", {}))
         middleware.setdefault("log_headers", HeadersMiddlewareFactory())
         super(UDFServer, self).__init__(
-            "grpc://" + location, middleware=middleware, **kwargs
+            f"{resolved_scheme}://{address}", middleware=middleware, **kwargs
         )
-        self._location = location
+        self._scheme = resolved_scheme
+        self._location = address
         self._metric_location = metric_location
         self._functions = {}
 
@@ -1172,6 +1305,47 @@ class UDFServer(FlightServerBase):
 
         self.add_function(builtin_echo)
         self.add_function(builtin_healthy)
+
+    @staticmethod
+    def _check_transport_security(
+        scheme: str, kwargs: Mapping[str, Any], require_tls: bool = False
+    ) -> None:
+        """Fail (strict mode) or warn when the served transport is plaintext.
+
+        pyarrow derives the transport security from the location scheme, so a
+        plaintext ``grpc://`` location makes it drop ``tls_certificates`` /
+        ``verify_client`` / ``root_certificates`` and keep serving cleartext
+        with no error. Because previous releases behaved this way silently, the
+        default is a loud warning so an upgrade does not turn a pre-existing
+        misconfiguration into a crash loop; pass ``require_tls=True`` (or set
+        ``TIDBCLOUDLAKE_UDF_REQUIRE_TLS=1``) to refuse to start instead.
+        """
+        tls_material = [name for name in _TLS_SERVER_KWARGS if kwargs.get(name)]
+        if scheme == TLS_SCHEME:
+            if not kwargs.get("tls_certificates"):
+                raise ValueError(
+                    "scheme='grpc+tls' requires tls_certificates=[(cert_pem, key_pem)]"
+                )
+            return
+        if require_tls:
+            raise ValueError(
+                "require_tls is enabled (require_tls=True or "
+                f"{REQUIRE_TLS_ENV_VAR}=1) but the transport scheme is 'grpc', "
+                "which is plaintext. Pass scheme='grpc+tls' (or an explicit "
+                "'grpc+tls://host:port' location) with "
+                "tls_certificates=[(cert_pem, key_pem)] to serve over TLS, or "
+                "drop the strict flag to serve plaintext with a warning."
+            )
+        if tls_material:
+            logger.warning(
+                "UDF server is serving Flight over PLAINTEXT: the transport scheme "
+                "is 'grpc', so the TLS options (%s) are being IGNORED and traffic "
+                "is not encrypted. Pass scheme='grpc+tls' with "
+                "tls_certificates=[(cert_pem, key_pem)] to serve over TLS, or pass "
+                "require_tls=True / set %s=1 to make this a startup error.",
+                ", ".join(tls_material),
+                REQUIRE_TLS_ENV_VAR,
+            )
 
     def _start_metrics_server(self):
         """Start Prometheus metrics HTTP server if metric_location is provided"""
@@ -1235,6 +1409,11 @@ class UDFServer(FlightServerBase):
         try:
             with self.response_duration.labels(function_name=func_name).time():
                 for batch in reader:
+                    # Reject batches whose caller-declared row count exceeds the
+                    # configured bound before any per-row allocation or task
+                    # submission happens.
+                    self._check_batch_size(func_name, batch.data.num_rows)
+
                     # Update row metrics
                     batch_rows = batch.data.num_rows
                     self.rows_count.labels(function_name=func_name).inc(batch_rows)
@@ -1287,10 +1466,8 @@ class UDFServer(FlightServerBase):
             output_type = f"TABLE ({column_defs})"
         else:
             output_type = _arrow_field_to_string(udf._result_schema[0])
-        sql = (
-            f"CREATE OR REPLACE FUNCTION {name} ({input_types}) "
-            f"RETURNS {output_type} LANGUAGE python "
-            f"HANDLER = '{name}' ADDRESS = 'http://{self._location}';"
+        sql = _build_create_function_sql(
+            name, input_types, output_type, self._location, self._scheme
         )
         logger.info(f"added function: {name}, SQL:\n{sql}\n")
 
@@ -1304,6 +1481,16 @@ class UDFServer(FlightServerBase):
             )
 
         super(UDFServer, self).serve()
+
+    def _check_batch_size(self, func_name: str, num_rows: int) -> None:
+        """Reject a batch that declares more rows than the configured bound."""
+        if self._max_batch_rows is not None and num_rows > self._max_batch_rows:
+            raise ValueError(
+                f"Function '{func_name}' rejected a batch of {num_rows} rows: "
+                f"max_batch_rows is {self._max_batch_rows}. Split the input into "
+                "smaller batches or raise max_batch_rows on the server if larger "
+                "batches are expected."
+            )
 
 
 def _input_process_func(field: pa.Field) -> Callable:
