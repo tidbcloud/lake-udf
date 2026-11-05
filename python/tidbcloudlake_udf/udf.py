@@ -18,6 +18,7 @@ import inspect
 import os
 import time
 from collections import deque
+from itertools import islice
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from threading import Semaphore
@@ -92,6 +93,10 @@ _TRUTHY_ENV_VALUES = ("1", "true", "yes", "on")
 # keeping worst-case per-batch allocation bounded; set ``max_batch_rows=None``
 # to restore the previous unbounded behaviour.
 DEFAULT_MAX_BATCH_ROWS = 1_000_000
+DEFAULT_MAX_BATCH_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_STREAM_ROWS = 10_000_000
+DEFAULT_MAX_STREAM_BYTES = 256 * 1024 * 1024
+OUTPUT_CHUNK_ROWS = 1024
 
 logger = logging.getLogger(__name__)
 
@@ -911,12 +916,12 @@ class TableFunction(CallableFunction):
             yield self._align_record_batch(result)
             return
         if isinstance(result, pa.Table):
-            for batch in result.to_batches():
+            for batch in result.to_reader(max_chunksize=OUTPUT_CHUNK_ROWS):
                 yield self._align_record_batch(batch)
             return
         if isinstance(result, Mapping):
             if self._is_column_mapping(result):
-                yield self._dict_to_batch(result)
+                yield from self._column_mapping_batches(result)
             else:
                 yield self._build_batch_from_rows([result])
             return
@@ -932,9 +937,12 @@ class TableFunction(CallableFunction):
                     if pending_rows:
                         yield self._build_batch_from_rows(pending_rows)
                         pending_rows = []
-                    yield self._dict_to_batch(item)
+                    yield from self._column_mapping_batches(item)
                 else:
                     pending_rows.append(item)
+                    if len(pending_rows) >= OUTPUT_CHUNK_ROWS:
+                        yield self._build_batch_from_rows(pending_rows)
+                        pending_rows = []
             if pending_rows:
                 yield self._build_batch_from_rows(pending_rows)
             return
@@ -942,20 +950,28 @@ class TableFunction(CallableFunction):
             f"Table function {self._name} must yield records, mappings, or pyarrow batches"
         )
 
-    def _dict_to_batch(self, mapping: Mapping[str, Sequence[Any]]) -> pa.RecordBatch:
-        lengths = set()
-        columns: List[pa.Array] = []
+    def _column_mapping_batches(self, mapping) -> Iterator[pa.RecordBatch]:
+        columns = []
         for field in self._result_schema:
             if field.name not in mapping:
                 raise ValueError(
                     f"Missing expected column '{field.name}' in column mapping"
                 )
-            values = list(mapping[field.name])
-            lengths.add(len(values))
-            columns.append(self._column_from_values(field, values))
-        if len(lengths) > 1:
-            raise ValueError("Column mapping contains columns of differing lengths")
-        return pa.RecordBatch.from_arrays(columns, schema=self._result_schema)
+            columns.append(iter(mapping[field.name]))
+        while True:
+            chunks = [list(islice(column, OUTPUT_CHUNK_ROWS)) for column in columns]
+            lengths = {len(chunk) for chunk in chunks}
+            if len(lengths) > 1:
+                raise ValueError("Column mapping contains columns of differing lengths")
+            if not chunks or not chunks[0]:
+                return
+            yield pa.RecordBatch.from_arrays(
+                [
+                    self._column_from_values(field, values)
+                    for field, values in zip(self._result_schema, chunks)
+                ],
+                schema=self._result_schema,
+            )
 
     def _build_batch_from_rows(self, rows: List[Any]) -> pa.RecordBatch:
         if not rows:
@@ -1218,6 +1234,9 @@ class UDFServer(FlightServerBase):
         metric_location=None,
         scheme: Optional[str] = None,
         max_batch_rows: Optional[int] = DEFAULT_MAX_BATCH_ROWS,
+        max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES,
+        max_stream_rows: int = DEFAULT_MAX_STREAM_ROWS,
+        max_stream_bytes: int = DEFAULT_MAX_STREAM_BYTES,
         require_tls: Optional[bool] = None,
         require_auth: bool = False,
         tenant_resolver: Optional[Callable[[bytes], str]] = None,
@@ -1254,6 +1273,14 @@ class UDFServer(FlightServerBase):
                     f"{max_batch_rows!r}"
                 )
         self._max_batch_rows = max_batch_rows
+        for name, value in (
+            ("max_batch_bytes", max_batch_bytes),
+            ("max_stream_rows", max_stream_rows),
+            ("max_stream_bytes", max_stream_bytes),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+            setattr(self, "_" + name, value)
 
         middleware = dict(kwargs.pop("middleware", {}))
         middleware.setdefault("log_headers", HeadersMiddlewareFactory())
@@ -1438,6 +1465,7 @@ class UDFServer(FlightServerBase):
         # Increment running requests gauge
         self.running_requests.labels(function_name=func_name).inc()
 
+        input_rows = input_bytes = output_rows = output_bytes = 0
         try:
             with self.response_duration.labels(function_name=func_name).time():
                 for batch in reader:
@@ -1445,6 +1473,11 @@ class UDFServer(FlightServerBase):
                     # configured bound before any per-row allocation or task
                     # submission happens.
                     self._check_batch_size(func_name, batch.data.num_rows)
+                    input_rows += batch.data.num_rows
+                    input_bytes += batch.data.nbytes
+                    self._check_resource_limits(
+                        batch.data, input_rows, input_bytes, "input"
+                    )
 
                     # Update row metrics
                     batch_rows = batch.data.num_rows
@@ -1453,6 +1486,12 @@ class UDFServer(FlightServerBase):
 
                     try:
                         for output_batch in udf.eval_batch(batch.data, request_headers):
+                            output_rows += output_batch.num_rows
+                            output_bytes += output_batch.nbytes
+                            self._check_batch_size(func_name, output_batch.num_rows)
+                            self._check_resource_limits(
+                                output_batch, output_rows, output_bytes, "output"
+                            )
                             writer.write_batch(output_batch)
                     finally:
                         # Decrease running rows gauge after processing
@@ -1513,6 +1552,20 @@ class UDFServer(FlightServerBase):
             )
 
         super(UDFServer, self).serve()
+
+    def _check_resource_limits(self, batch, rows, byte_count, direction):
+        if batch.nbytes > self._max_batch_bytes:
+            raise ValueError(
+                f"{direction} exceeds max_batch_bytes={self._max_batch_bytes}"
+            )
+        if rows > self._max_stream_rows:
+            raise ValueError(
+                f"{direction} exceeds max_stream_rows={self._max_stream_rows}"
+            )
+        if byte_count > self._max_stream_bytes:
+            raise ValueError(
+                f"{direction} exceeds max_stream_bytes={self._max_stream_bytes}"
+            )
 
     def _check_batch_size(self, func_name: str, num_rows: int) -> None:
         """Reject a batch that declares more rows than the configured bound."""
