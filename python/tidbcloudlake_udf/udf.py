@@ -43,6 +43,7 @@ import pyarrow as pa
 from pyarrow.flight import (
     FlightServerBase,
     FlightInfo,
+    FlightUnauthenticatedError,
     ServerMiddleware,
     ServerMiddlewareFactory,
 )
@@ -1218,6 +1219,8 @@ class UDFServer(FlightServerBase):
         scheme: Optional[str] = None,
         max_batch_rows: Optional[int] = DEFAULT_MAX_BATCH_ROWS,
         require_tls: Optional[bool] = None,
+        require_auth: bool = False,
+        tenant_resolver: Optional[Callable[[bytes], str]] = None,
         **kwargs,
     ):
         location_scheme, address = _split_location(location)
@@ -1232,6 +1235,18 @@ class UDFServer(FlightServerBase):
         )
         self._require_tls = _resolve_require_tls(require_tls)
         self._check_transport_security(resolved_scheme, kwargs, self._require_tls)
+        if not isinstance(require_auth, bool):
+            raise ValueError("require_auth must be a boolean")
+        authenticated = kwargs.get("auth_handler") is not None or (
+            resolved_scheme == "grpc+tls" and kwargs.get("verify_client") is True
+        )
+        if (require_auth or tenant_resolver is not None) and not authenticated:
+            raise ValueError(
+                "require_auth/tenant_resolver requires auth_handler or TLS with verify_client=True"
+            )
+        if tenant_resolver is not None and not callable(tenant_resolver):
+            raise ValueError("tenant_resolver must be callable")
+        self._tenant_resolver = tenant_resolver
         if max_batch_rows is not None:
             if not isinstance(max_batch_rows, int) or max_batch_rows <= 0:
                 raise ValueError(
@@ -1367,6 +1382,8 @@ class UDFServer(FlightServerBase):
 
     def get_flight_info(self, context, descriptor):
         """Return the result schema of a function."""
+        if self._tenant_resolver is not None:
+            self._request_headers(context)
         func_name = descriptor.path[0].decode("utf-8")
         if func_name not in self._functions:
             raise ValueError(f"Function {func_name} does not exists")
@@ -1386,20 +1403,35 @@ class UDFServer(FlightServerBase):
             total_bytes=0,
         )
 
+    def _request_headers(self, context):
+        middleware = context.get_middleware("log_headers")
+        headers = dict(middleware.headers) if middleware else {}
+        if self._tenant_resolver is not None:
+            identity = context.peer_identity()
+            if not identity:
+                raise FlightUnauthenticatedError(
+                    "Authenticated peer identity is required for tenant resolution"
+                )
+            tenant = self._tenant_resolver(identity)
+            if not isinstance(tenant, str) or not tenant:
+                raise FlightUnauthenticatedError(
+                    "Peer identity has no authorized tenant"
+                )
+            # Replace every spelling in both the raw and normalized views.
+            headers = {
+                k: v for k, v in headers.items() if k.lower() != "x-databend-tenant"
+            }
+            headers["x-databend-tenant"] = [tenant]
+        return Headers(headers, context=context)
+
     def do_exchange(self, context, descriptor, reader, writer):
         """Call a function from the client."""
         func_name = descriptor.path[0].decode("utf-8")
         if func_name not in self._functions:
             raise ValueError(f"Function {func_name} does not exists")
         udf = self._functions[func_name]
+        request_headers = self._request_headers(context)
         writer.begin(udf._result_schema)
-
-        headers_middleware = context.get_middleware("log_headers")
-        # Pass context to Headers so that query_state can check context.is_cancelled()
-        request_headers = Headers(
-            headers_middleware.headers if headers_middleware else None,
-            context=context,
-        )
 
         # Increment request counter
         self.requests_count.labels(function_name=func_name).inc()
