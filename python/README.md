@@ -7,11 +7,13 @@ Write user-defined functions in Python for TiDB Cloud Lake.
 ```python
 from tidbcloudlake_udf import udf, UDFServer
 
+
 @udf(input_types=["INT", "INT"], result_type="INT")
 def add(a: int, b: int) -> int:
     return a + b
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     server = UDFServer("0.0.0.0:8815")
     server.add_function(add)
     server.serve()
@@ -68,7 +70,9 @@ If traffic really is unencrypted, fix the configuration by adding
 opt into strict mode:
 
 ```python
-server = UDFServer("0.0.0.0:8815", scheme="grpc+tls", tls_certificates=..., require_tls=True)
+server = UDFServer(
+    "0.0.0.0:8815", scheme="grpc+tls", tls_certificates=..., require_tls=True
+)
 ```
 
 or set the environment variable for the whole deployment:
@@ -144,17 +148,21 @@ from tidbcloudlake_udf import udf
 import datetime
 from decimal import Decimal
 
+
 @udf(input_types=["INT"], result_type="INT")
 def double(x: int) -> int:
     return x * 2
+
 
 @udf(input_types=["VARCHAR"], result_type="VARCHAR")
 def upper(s: str) -> str:
     return s.upper()
 
+
 @udf(input_types=["DATE", "INT"], result_type="DATE")
 def add_days(d: datetime.date, days: int) -> datetime.date:
     return d + datetime.timedelta(days=days)
+
 
 @udf(input_types=["DECIMAL(10,2)"], result_type="DECIMAL(10,2)")
 def add_tax(price: Decimal) -> Decimal:
@@ -166,17 +174,21 @@ def add_tax(price: Decimal) -> Decimal:
 ```python
 from typing import List, Dict, Tuple
 
+
 @udf(input_types=["ARRAY(INT)"], result_type="INT")
 def array_sum(arr: List[int]) -> int:
     return sum(arr)
+
 
 @udf(input_types=["MAP(VARCHAR, INT)"], result_type="INT")
 def map_sum(m: Dict[str, int]) -> int:
     return sum(m.values())
 
+
 @udf(input_types=["TUPLE(INT, VARCHAR)"], result_type="VARCHAR")
 def tuple_format(t: Tuple[int, str]) -> str:
     return f"{t[0]}: {t[1]}"
+
 
 @udf(input_types=["VECTOR(128)"], result_type="VECTOR(128)")
 def normalize_vector(v: List[float]) -> List[float]:
@@ -189,15 +201,18 @@ def normalize_vector(v: List[float]) -> List[float]:
 ```python
 from typing import Optional
 
+
 # Option 1: skip_null=True - NULL input returns NULL
 @udf(input_types=["INT"], result_type="INT", skip_null=True)
 def double(x: int) -> int:
     return x * 2
 
+
 # Option 2: skip_null=False - Handle NULL manually
 @udf(input_types=["INT"], result_type="INT", skip_null=False)
 def double_or_zero(x: Optional[int]) -> int:
     return x * 2 if x is not None else 0
+
 
 # Nullable array elements
 @udf(input_types=["ARRAY(INT NULL)"], result_type="INT", skip_null=False)
@@ -214,10 +229,7 @@ def sum_non_null(arr: List[Optional[int]]) -> int:
     batch_mode=True,
 )
 def expand_pairs(left: List[int], right: List[int]):
-    return [
-        {"left": l, "right": r, "sum": l + r}
-        for l, r in zip(left, right)
-    ]
+    return [{"left": l, "right": r, "sum": l + r} for l, r in zip(left, right)]
 ```
 
 ```sql
@@ -230,6 +242,7 @@ For I/O-bound functions (e.g., network requests, file operations), use `io_threa
 
 ```python
 import time
+
 
 @udf(input_types=["INT"], result_type="INT", io_threads=32)
 def fetch_data(id: int) -> int:
@@ -245,6 +258,7 @@ To protect your UDF server from being overwhelmed, use `max_concurrency` to limi
 
 ```python
 from tidbcloudlake_udf import udf, UDFServer
+
 
 @udf(input_types=["INT"], result_type="INT", max_concurrency=10)
 def expensive_operation(x: int) -> int:
@@ -274,8 +288,8 @@ You can combine `io_threads` and `max_concurrency`:
 @udf(
     input_types=["INT"],
     result_type="INT",
-    io_threads=32,           # 32 threads for I/O within each request
-    max_concurrency=5,       # But only 5 concurrent requests allowed
+    io_threads=32,  # 32 threads for I/O within each request
+    max_concurrency=5,  # But only 5 concurrent requests allowed
     concurrency_timeout=60,  # Wait up to 60s for a slot
 )
 def api_call(id: int) -> int:
@@ -366,3 +380,21 @@ ruff format python/tidbcloudlake_udf python/tests
 ---
 
 Inspired by [RisingWave Python API](https://pypi.org/project/risingwave/).
+
+### Requiring authentication and binding tenant identity
+
+`UDFServer(..., require_auth=True, auth_handler=handler)` refuses to start
+without an Arrow Flight authentication handler. TLS with `verify_client=True`
+also satisfies this guard. Combine this with `scheme="grpc+tls"` and
+`require_tls=True`; authentication alone does not encrypt query data or stage
+credentials. Existing defaults remain unchanged for existing engine clients.
+
+For shared services, pass `tenant_resolver=resolve_tenant` to map the verified
+`context.peer_identity()` bytes to an authorized tenant string. It requires an
+authentication configuration and a nonempty peer identity, and replaces the
+caller-supplied tenant header before invoking a UDF. Returning an empty tenant
+rejects the request. Configure the resolver with your trusted identity-to-tenant
+mapping; it must not derive the tenant from request headers. Verify that your
+engine supports the selected Flight authentication or mTLS configuration. mTLS
+alone does not guarantee Arrow exposes a peer identity suitable for this mapping.
+Without a resolver, `headers.tenant` remains untrusted request metadata.

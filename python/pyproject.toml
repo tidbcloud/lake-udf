@@ -21,3 +21,7 @@ test = ["pytest"]
 [project.urls]
 Repository = "https://github.com/tidbcloud/lake-udf"
 Homepage = "https://tidbcloud.com"
+
+# Keep the established correctness checks stable across Ruff default changes.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
