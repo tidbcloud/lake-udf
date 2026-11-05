@@ -916,7 +916,7 @@ class TableFunction(CallableFunction):
             yield self._align_record_batch(result)
             return
         if isinstance(result, pa.Table):
-            for batch in result.to_batches(max_chunksize=OUTPUT_CHUNK_ROWS):
+            for batch in result.to_reader(max_chunksize=OUTPUT_CHUNK_ROWS):
                 yield self._align_record_batch(batch)
             return
         if isinstance(result, Mapping):

@@ -186,3 +186,16 @@ def test_infinite_output_is_chunked_and_stopped_by_stream_limit():
             _call_raw(port, "endless", batch)
     finally:
         _stop(process)
+
+
+def test_large_null_table_is_read_lazily():
+    from itertools import islice
+    from tidbcloudlake_udf.udf import TableFunction, OUTPUT_CHUNK_ROWS
+
+    schema = pa.schema([pa.field("value", pa.null())])
+    function = TableFunction(lambda value: None, ["INT"], schema, name="null_table")
+    # Metadata-only table: to_batches() would eagerly allocate almost a billion
+    # Python RecordBatch objects before the first stream budget check.
+    table = pa.Table.from_arrays([pa.nulls(10**12)], schema=schema)
+    first = list(islice(function._iter_output_batches(table), 2))
+    assert [batch.num_rows for batch in first] == [OUTPUT_CHUNK_ROWS] * 2
