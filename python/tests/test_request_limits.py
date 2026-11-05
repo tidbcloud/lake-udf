@@ -137,3 +137,52 @@ def test_bounded_submission_keeps_row_order(default_batch_server):
     batches = _call_raw(port, "add_one", batch)
     results = [value.as_py() for result in batches for value in result.column(0)]
     assert results == [value + 1 for value in values]
+
+
+@pytest.mark.parametrize(
+    "name", ["max_batch_bytes", "max_stream_rows", "max_stream_bytes"]
+)
+def test_invalid_resource_limits(name):
+    with pytest.raises(ValueError, match=name):
+        UDFServer(f"127.0.0.1:{_free_port()}", **{name: 0})
+
+
+def test_input_byte_limit_over_flight():
+    port, process = _spawn_server(UDF_MAX_BATCH_BYTES="16")
+    try:
+        batch = pa.record_batch(
+            [pa.array(list(range(8)), type=pa.int32())], names=["value"]
+        )
+        with pytest.raises(Exception, match="max_batch_bytes"):
+            _call_raw(port, "add_one", batch)
+    finally:
+        _stop(process)
+
+
+def test_total_input_limit_across_batches():
+    port, process = _spawn_server(UDF_MAX_STREAM_ROWS="8")
+    try:
+        client = fl.FlightClient(f"grpc://127.0.0.1:{port}")
+        writer, reader = client.do_exchange(fl.FlightDescriptor.for_path("add_one"))
+        batch = pa.record_batch(
+            [pa.array(list(range(5)), type=pa.int32())], names=["value"]
+        )
+        with pytest.raises(Exception, match="max_stream_rows"):
+            with writer:
+                writer.begin(batch.schema)
+                writer.write_batch(batch)
+                writer.write_batch(batch)
+                writer.done_writing()
+                list(reader)
+    finally:
+        _stop(process)
+
+
+def test_infinite_output_is_chunked_and_stopped_by_stream_limit():
+    port, process = _spawn_server(UDF_MAX_STREAM_ROWS="2048")
+    try:
+        batch = pa.record_batch([pa.array([1], type=pa.int32())], names=["value"])
+        with pytest.raises(Exception, match="max_stream_rows"):
+            _call_raw(port, "endless", batch)
+    finally:
+        _stop(process)

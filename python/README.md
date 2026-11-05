@@ -398,3 +398,21 @@ mapping; it must not derive the tenant from request headers. Verify that your
 engine supports the selected Flight authentication or mTLS configuration. mTLS
 alone does not guarantee Arrow exposes a peer identity suitable for this mapping.
 Without a resolver, `headers.tenant` remains untrusted request metadata.
+
+### Request resource budgets
+
+`UDFServer` defaults to 64 MiB per decoded input/output batch and, separately for
+each direction, 10 million rows / 256 MiB per DoExchange stream. Configure these
+with positive `max_batch_bytes`, `max_stream_rows` and `max_stream_bytes` values.
+The existing per-batch row limit also applies to output. Table-function iterables
+and column mappings are consumed in chunks of at most 1024 rows, so even an
+infinite iterable reaches the stream budget instead of collecting forever.
+Checks run before input conversion and before each output write. A rejected
+stream may already have delivered earlier output batches; consumers must treat
+the failed exchange as unsuccessful.
+
+These are framework budgets after Arrow decodes each incoming batch. Python's
+FlightServerBase does not expose gRPC receive-message-size options; use the
+caller/runtime's transport limit for the native decoding boundary. Function code
+is trusted: a function that allocates memory or never yields cannot be sandboxed
+by these counters. Arbitrary function isolation requires a separate worker design.
