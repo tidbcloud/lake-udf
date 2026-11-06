@@ -2,10 +2,12 @@
 
 import json
 import logging
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pyarrow as pa
 import pyarrow.flight as fl
+
+from .udf import _resolve_require_tls
 
 
 # Wire protocol -- fixed by the query engine, not a brand name to rebrand.
@@ -34,7 +36,7 @@ class UDFClient:
         private_key: bytes = None,
         disable_server_verification: bool = None,
         override_hostname: str = None,
-        require_tls: bool = False,
+        require_tls: Optional[bool] = None,
     ):
         """
         Initialize UDF client.
@@ -50,10 +52,11 @@ class UDFClient:
             private_key: PEM-encoded client private key, for mutual TLS.
             disable_server_verification: Skip server certificate verification.
             override_hostname: Override the hostname checked by TLS.
-            require_tls: Refuse to connect over plaintext. Defaults to False,
+            require_tls: Refuse plaintext; None inherits TIDBCLOUDLAKE_UDF_REQUIRE_TLS,
                 matching previous releases, which allows plaintext with a
                 warning when TLS options are supplied.
         """
+        require_tls = _resolve_require_tls(require_tls)
         scheme = scheme.lower()
         if scheme not in _SUPPORTED_SCHEMES:
             raise ValueError(
