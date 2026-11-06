@@ -121,9 +121,16 @@ def _normalize_scheme(scheme: str) -> str:
 def _resolve_require_tls(require_tls: Optional[bool]) -> bool:
     """Resolve the strict-transport flag, falling back to the environment."""
     if require_tls is not None:
-        return bool(require_tls)
+        if not isinstance(require_tls, bool):
+            raise ValueError("require_tls must be a boolean or None")
+        return require_tls
     value = os.environ.get(REQUIRE_TLS_ENV_VAR)
-    return value is not None and value.strip().lower() in _TRUTHY_ENV_VALUES
+    if value is None:
+        return False
+    normalized = value.strip().lower()
+    if normalized not in {"1", "0", "true", "false", "yes", "no", "on", "off"}:
+        raise ValueError("Invalid TIDBCLOUDLAKE_UDF_REQUIRE_TLS; use true or false")
+    return normalized in _TRUTHY_ENV_VALUES
 
 
 def _build_create_function_sql(
@@ -1240,6 +1247,9 @@ class UDFServer(FlightServerBase):
         require_tls: Optional[bool] = None,
         require_auth: bool = False,
         tenant_resolver: Optional[Callable[[bytes], str]] = None,
+        stage_grant_resolver: Optional[
+            Callable[[bytes, str], Mapping[str, Any]]
+        ] = None,
         **kwargs,
     ):
         location_scheme, address = _split_location(location)
@@ -1259,13 +1269,24 @@ class UDFServer(FlightServerBase):
         authenticated = kwargs.get("auth_handler") is not None or (
             resolved_scheme == "grpc+tls" and kwargs.get("verify_client") is True
         )
-        if (require_auth or tenant_resolver is not None) and not authenticated:
+        if (
+            require_auth
+            or tenant_resolver is not None
+            or stage_grant_resolver is not None
+        ) and not authenticated:
             raise ValueError(
                 "require_auth/tenant_resolver requires auth_handler or TLS with verify_client=True"
             )
         if tenant_resolver is not None and not callable(tenant_resolver):
             raise ValueError("tenant_resolver must be callable")
         self._tenant_resolver = tenant_resolver
+        if stage_grant_resolver is not None and (
+            tenant_resolver is None or not callable(stage_grant_resolver)
+        ):
+            raise ValueError(
+                "stage_grant_resolver requires a tenant_resolver and must be callable"
+            )
+        self._stage_grant_resolver = stage_grant_resolver
         if max_batch_rows is not None:
             if not isinstance(max_batch_rows, int) or max_batch_rows <= 0:
                 raise ValueError(
@@ -1449,6 +1470,24 @@ class UDFServer(FlightServerBase):
                 k: v for k, v in headers.items() if k.lower() != "x-databend-tenant"
             }
             headers["x-databend-tenant"] = [tenant]
+        resolver = getattr(self, "_stage_grant_resolver", None)
+        if resolver is not None:
+            # Rebuild grants from verified identity. Never merge a caller's
+            # endpoint/credentials into the trusted resolver result.
+            headers = {
+                k: v
+                for k, v in headers.items()
+                if k.lower().replace("_", "-") != "databend-stage-mapping"
+            }
+            try:
+                grants = resolver(identity, tenant)
+                if not isinstance(grants, Mapping):
+                    raise ValueError("Invalid stage grant result")
+                headers["databend-stage-mapping"] = [json.dumps(dict(grants))]
+            except Exception:
+                raise FlightUnauthenticatedError(
+                    "No authorized stage grants for this identity"
+                ) from None
         return Headers(headers, context=context)
 
     def do_exchange(self, context, descriptor, reader, writer):

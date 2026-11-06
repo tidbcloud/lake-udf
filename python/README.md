@@ -416,3 +416,18 @@ FlightServerBase does not expose gRPC receive-message-size options; use the
 caller/runtime's transport limit for the native decoding boundary. Function code
 is trusted: a function that allocates memory or never yields cannot be sandboxed
 by these counters. Arbitrary function isolation requires a separate worker design.
+
+### Verified stage grants
+
+For a shared authenticated server, pass `tenant_resolver(identity)` and
+`stage_grant_resolver(identity, tenant)` alongside `auth_handler` or mTLS. The
+stage resolver returns the stage-mapping dictionary from trusted configuration;
+request-supplied mapping headers are removed and replaced. Returning an empty
+mapping grants no stages. Resolver failures reject the request without exposing
+credentials. Refresh/revoke grants in the resolver; it is called on every RPC.
+Legacy caller-delegated stage credentials remain available when no stage resolver
+is configured, and should only be accepted from trusted callers.
+
+Both server and client inherit `TIDBCLOUDLAKE_UDF_REQUIRE_TLS` when
+`require_tls=None`. Invalid values fail closed; an explicit boolean overrides
+the environment. Authentication and storage grants do not substitute for TLS.

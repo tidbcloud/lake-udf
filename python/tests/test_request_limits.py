@@ -106,7 +106,9 @@ def test_invalid_max_batch_rows_rejected():
 
 def test_oversized_declared_rows_rejected(default_batch_server):
     """A tiny batch declaring a billion rows is refused, not materialized."""
-    batch = pa.RecordBatch.from_arrays([pa.nulls(1_000_000_000)], names=["x"])
+    batch = pa.RecordBatch.from_arrays(
+        [pa.Array.from_buffers(pa.null(), 1_000_000_000, [None])], names=["x"]
+    )
     assert batch.nbytes == 0
     with pytest.raises(Exception, match="max_batch_rows"):
         _call_raw(default_batch_server, "builtin_healthy", batch)
@@ -194,8 +196,11 @@ def test_large_null_table_is_read_lazily():
 
     schema = pa.schema([pa.field("value", pa.null())])
     function = TableFunction(lambda value: None, ["INT"], schema, name="null_table")
-    # Metadata-only table: to_batches() would eagerly allocate almost a billion
+    # Build explicitly without allocation: some Arrow versions allocate a
+    # temporary bitmap in nulls(). to_batches() would eagerly allocate almost a billion
     # Python RecordBatch objects before the first stream budget check.
-    table = pa.Table.from_arrays([pa.nulls(10**12)], schema=schema)
+    table = pa.Table.from_arrays(
+        [pa.Array.from_buffers(pa.null(), 10**12, [None])], schema=schema
+    )
     first = list(islice(function._iter_output_batches(table), 2))
     assert [batch.num_rows for batch in first] == [OUTPUT_CHUNK_ROWS] * 2
