@@ -7,7 +7,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import pyarrow as pa
 import pyarrow.flight as fl
 
-from .udf import _resolve_require_tls
+from .udf import _allow_insecure_network, _is_loopback_host, _resolve_require_tls
 
 
 # Wire protocol -- fixed by the query engine, not a brand name to rebrand.
@@ -78,6 +78,8 @@ class UDFClient:
                     "require_tls=True but the transport scheme is 'grpc', which is "
                     "plaintext. Pass scheme='grpc+tls' to connect over TLS."
                 )
+            if not _is_loopback_host(host) and not _allow_insecure_network():
+                raise ValueError("Non-loopback Flight clients require TLS")
             if tls_options:
                 logger.warning(
                     "UDF client is connecting over PLAINTEXT: the transport scheme "

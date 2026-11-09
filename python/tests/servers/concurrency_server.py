@@ -56,7 +56,7 @@ def slow_add_wait(x):
 
 def create_concurrency_server(port=8815):
     """Create server with concurrency-limited functions."""
-    server = UDFServer(f"0.0.0.0:{port}")
+    server = UDFServer(f"127.0.0.1:{port}")
     server.add_function(slow_add_limited)
     server.add_function(slow_add_unlimited)
     server.add_function(single_concurrency)
