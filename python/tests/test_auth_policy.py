@@ -79,7 +79,9 @@ def test_flight_transport_rejects_anonymous_and_accepts_authenticated_peer():
         tenant_resolver=lambda identity: (
             "tenant" if identity == b"verified-user" else ""
         ),
-        function_authorizer=lambda identity, tenant, name: name in {"builtin_healthy", "trusted_tenant"},
+        function_authorizer=lambda identity, tenant, name: (
+            name in {"builtin_healthy", "trusted_tenant"}
+        ),
     )
     try:
         descriptor = flight.FlightDescriptor.for_path("builtin_healthy")
@@ -91,7 +93,9 @@ def test_flight_transport_rejects_anonymous_and_accepts_authenticated_peer():
         client.authenticate(_ClientAuth())
         assert client.get_flight_info(descriptor).schema is not None
         with pytest.raises(flight.FlightUnauthorizedError):
-            client.get_flight_info(flight.FlightDescriptor.for_path("other_tenant_function"))
+            client.get_flight_info(
+                flight.FlightDescriptor.for_path("other_tenant_function")
+            )
 
         @udf(input_types=["VARCHAR"], result_type="VARCHAR")
         def trusted_tenant(value, headers):
@@ -126,6 +130,9 @@ def test_unverified_stage_and_tenant_headers_are_ignored():
     server = policy_server(None)
     context = Mock()
     context.get_middleware.return_value = SimpleNamespace(
-        headers={"DATABEND_STAGE_MAPPING": ["caller-grant"], "X-Databend-Tenant": ["caller-tenant"]}
+        headers={
+            "DATABEND_STAGE_MAPPING": ["caller-grant"],
+            "X-Databend-Tenant": ["caller-tenant"],
+        }
     )
     assert server._request_headers(context).raw_headers == {}

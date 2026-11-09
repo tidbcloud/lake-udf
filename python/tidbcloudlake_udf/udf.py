@@ -1265,7 +1265,9 @@ class UDFServer(FlightServerBase):
         stage_grant_resolver: Optional[
             Callable[[bytes, str], Mapping[str, Any]]
         ] = None,
-        function_authorizer: Optional[Callable[[bytes, Optional[str], str], bool]] = None,
+        function_authorizer: Optional[
+            Callable[[bytes, Optional[str], str], bool]
+        ] = None,
         allow_untrusted_stage_mapping: bool = False,
         **kwargs,
     ):
@@ -1287,7 +1289,9 @@ class UDFServer(FlightServerBase):
             resolved_scheme == "grpc+tls" and kwargs.get("verify_client") is True
         )
         if (
-            require_auth or tenant_resolver is not None or stage_grant_resolver is not None
+            require_auth
+            or tenant_resolver is not None
+            or stage_grant_resolver is not None
             or function_authorizer is not None
         ) and not authenticated:
             raise ValueError(
@@ -1300,12 +1304,16 @@ class UDFServer(FlightServerBase):
         if tenant_resolver is not None and function_authorizer is None:
             raise ValueError("tenant_resolver requires a function_authorizer")
         host = address.rsplit(":", 1)[0]
-        if not _is_loopback_host(host) and not (resolved_scheme == "grpc+tls" and authenticated):
+        if not _is_loopback_host(host) and not (
+            resolved_scheme == "grpc+tls" and authenticated
+        ):
             if not _allow_insecure_network():
                 raise ValueError("Non-loopback Flight requires TLS and authentication")
         if metric_location and not _is_loopback_host(metric_location.rsplit(":", 1)[0]):
             if not _allow_insecure_network():
-                raise ValueError("The unauthenticated metrics listener requires loopback")
+                raise ValueError(
+                    "The unauthenticated metrics listener requires loopback"
+                )
         self._require_auth = require_auth or authenticated
         self._function_authorizer = function_authorizer
         if not isinstance(allow_untrusted_stage_mapping, bool):
@@ -1463,7 +1471,9 @@ class UDFServer(FlightServerBase):
     def get_flight_info(self, context, descriptor):
         """Return the result schema of a function."""
         func_name = descriptor.path[0].decode("utf-8")
-        self._request_headers(context, function_name=func_name, include_stage_grants=False)
+        self._request_headers(
+            context, function_name=func_name, include_stage_grants=False
+        )
         if func_name not in self._functions:
             raise ValueError(f"Function {func_name} does not exists")
         udf = self._functions[func_name]
@@ -1482,7 +1492,9 @@ class UDFServer(FlightServerBase):
             total_bytes=0,
         )
 
-    def _request_headers(self, context, *, function_name=None, include_stage_grants=True):
+    def _request_headers(
+        self, context, *, function_name=None, include_stage_grants=True
+    ):
         middleware = context.get_middleware("log_headers")
         headers = dict(middleware.headers) if middleware else {}
         tenant = None
@@ -1491,7 +1503,9 @@ class UDFServer(FlightServerBase):
         if getattr(self, "_require_auth", False) or self._tenant_resolver is not None:
             identity = context.peer_identity()
             if not identity:
-                raise FlightUnauthenticatedError("Authenticated peer identity is required")
+                raise FlightUnauthenticatedError(
+                    "Authenticated peer identity is required"
+                )
         if self._tenant_resolver is not None:
             tenant = self._tenant_resolver(identity)
             if not isinstance(tenant, str) or not tenant:
@@ -1508,7 +1522,9 @@ class UDFServer(FlightServerBase):
             if allowed is not True:
                 raise FlightUnauthorizedError("Function access denied")
         resolver = getattr(self, "_stage_grant_resolver", None)
-        if resolver is not None or not getattr(self, "_allow_untrusted_stage_mapping", False):
+        if resolver is not None or not getattr(
+            self, "_allow_untrusted_stage_mapping", False
+        ):
             headers = {
                 k: v
                 for k, v in headers.items()
