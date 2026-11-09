@@ -26,7 +26,7 @@ def setup_function():
 
 def test_scalar_sql(caplog):
     with caplog.at_level(logging.INFO):
-        server = UDFServer("0.0.0.0:0")
+        server = UDFServer("127.0.0.1:0")
         server.add_function(scalar_func)
 
         assert "CREATE OR REPLACE FUNCTION scalar_func (x INT)" in caplog.text
@@ -35,7 +35,7 @@ def test_scalar_sql(caplog):
 
 def test_stage_sql(caplog):
     with caplog.at_level(logging.INFO):
-        server = UDFServer("0.0.0.0:0")
+        server = UDFServer("127.0.0.1:0")
         server.add_function(stage_func)
 
         assert (
@@ -47,7 +47,7 @@ def test_stage_sql(caplog):
 
 def test_table_sql(caplog):
     with caplog.at_level(logging.INFO):
-        server = UDFServer("0.0.0.0:0")
+        server = UDFServer("127.0.0.1:0")
         server.add_function(table_func)
 
         assert "CREATE OR REPLACE FUNCTION table_func (x INT)" in caplog.text

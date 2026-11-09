@@ -67,7 +67,7 @@ def cancellable_generator(count: int, headers=None):
 
 def create_server(port: int) -> UDFServer:
     """Create server with cancellation-testable functions."""
-    server = UDFServer(f"0.0.0.0:{port}")
+    server = UDFServer(f"127.0.0.1:{port}")
     server.add_function(slow_scalar)
     server.add_function(cancellable_counter)
     server.add_function(cancellable_generator)

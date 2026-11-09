@@ -168,7 +168,7 @@ def expand_pairs(lhs: List[int], rhs: List[int]):
 
 def create_server(port: int) -> UDFServer:
     """Create server with all type-testing functions."""
-    server = UDFServer(f"0.0.0.0:{port}")
+    server = UDFServer(f"127.0.0.1:{port}")
 
     # Scalar types
     for fn in [

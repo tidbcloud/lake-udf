@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+from ipaddress import ip_address
 import logging
 import inspect
 import os
@@ -45,6 +46,7 @@ from pyarrow.flight import (
     FlightServerBase,
     FlightInfo,
     FlightUnauthenticatedError,
+    FlightUnauthorizedError,
     ServerMiddleware,
     ServerMiddlewareFactory,
 )
@@ -116,6 +118,19 @@ def _normalize_scheme(scheme: str) -> str:
             f"Unsupported transport scheme {scheme!r}; expected one of {_SUPPORTED_SCHEMES}"
         )
     return scheme
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
+def _allow_insecure_network() -> bool:
+    return os.environ.get("TIDBCLOUDLAKE_UDF_ALLOW_INSECURE_NETWORK") == "1"
 
 
 def _resolve_require_tls(require_tls: Optional[bool]) -> bool:
@@ -1212,7 +1227,7 @@ class UDFServer(FlightServerBase):
     pyarrow, e.g.::
 
         UDFServer(
-            location="0.0.0.0:8815",
+            location="127.0.0.1:8815",
             scheme="grpc+tls",
             tls_certificates=[(cert_pem, key_pem)],
             verify_client=True,
@@ -1237,7 +1252,7 @@ class UDFServer(FlightServerBase):
 
     def __init__(
         self,
-        location="0.0.0.0:8815",
+        location="127.0.0.1:8815",
         metric_location=None,
         scheme: Optional[str] = None,
         max_batch_rows: Optional[int] = DEFAULT_MAX_BATCH_ROWS,
@@ -1250,6 +1265,10 @@ class UDFServer(FlightServerBase):
         stage_grant_resolver: Optional[
             Callable[[bytes, str], Mapping[str, Any]]
         ] = None,
+        function_authorizer: Optional[
+            Callable[[bytes, Optional[str], str], bool]
+        ] = None,
+        allow_untrusted_stage_mapping: bool = False,
         **kwargs,
     ):
         location_scheme, address = _split_location(location)
@@ -1273,12 +1292,33 @@ class UDFServer(FlightServerBase):
             require_auth
             or tenant_resolver is not None
             or stage_grant_resolver is not None
+            or function_authorizer is not None
         ) and not authenticated:
             raise ValueError(
                 "require_auth/tenant_resolver requires auth_handler or TLS with verify_client=True"
             )
         if tenant_resolver is not None and not callable(tenant_resolver):
             raise ValueError("tenant_resolver must be callable")
+        if function_authorizer is not None and not callable(function_authorizer):
+            raise ValueError("function_authorizer must be callable")
+        if tenant_resolver is not None and function_authorizer is None:
+            raise ValueError("tenant_resolver requires a function_authorizer")
+        host = address.rsplit(":", 1)[0]
+        if not _is_loopback_host(host) and not (
+            resolved_scheme == "grpc+tls" and authenticated
+        ):
+            if not _allow_insecure_network():
+                raise ValueError("Non-loopback Flight requires TLS and authentication")
+        if metric_location and not _is_loopback_host(metric_location.rsplit(":", 1)[0]):
+            if not _allow_insecure_network():
+                raise ValueError(
+                    "The unauthenticated metrics listener requires loopback"
+                )
+        self._require_auth = require_auth or authenticated
+        self._function_authorizer = function_authorizer
+        if not isinstance(allow_untrusted_stage_mapping, bool):
+            raise ValueError("allow_untrusted_stage_mapping must be a boolean")
+        self._allow_untrusted_stage_mapping = allow_untrusted_stage_mapping
         self._tenant_resolver = tenant_resolver
         if stage_grant_resolver is not None and (
             tenant_resolver is None or not callable(stage_grant_resolver)
@@ -1430,9 +1470,10 @@ class UDFServer(FlightServerBase):
 
     def get_flight_info(self, context, descriptor):
         """Return the result schema of a function."""
-        if self._tenant_resolver is not None:
-            self._request_headers(context)
         func_name = descriptor.path[0].decode("utf-8")
+        self._request_headers(
+            context, function_name=func_name, include_stage_grants=False
+        )
         if func_name not in self._functions:
             raise ValueError(f"Function {func_name} does not exists")
         udf = self._functions[func_name]
@@ -1451,34 +1492,45 @@ class UDFServer(FlightServerBase):
             total_bytes=0,
         )
 
-    def _request_headers(self, context):
+    def _request_headers(
+        self, context, *, function_name=None, include_stage_grants=True
+    ):
         middleware = context.get_middleware("log_headers")
         headers = dict(middleware.headers) if middleware else {}
-        if self._tenant_resolver is not None:
+        tenant = None
+        identity = None
+        headers = {k: v for k, v in headers.items() if k.lower() != "x-databend-tenant"}
+        if getattr(self, "_require_auth", False) or self._tenant_resolver is not None:
             identity = context.peer_identity()
             if not identity:
                 raise FlightUnauthenticatedError(
-                    "Authenticated peer identity is required for tenant resolution"
+                    "Authenticated peer identity is required"
                 )
+        if self._tenant_resolver is not None:
             tenant = self._tenant_resolver(identity)
             if not isinstance(tenant, str) or not tenant:
                 raise FlightUnauthenticatedError(
                     "Peer identity has no authorized tenant"
                 )
-            # Replace every spelling in both the raw and normalized views.
-            headers = {
-                k: v for k, v in headers.items() if k.lower() != "x-databend-tenant"
-            }
             headers["x-databend-tenant"] = [tenant]
+        authorizer = getattr(self, "_function_authorizer", None)
+        if function_name is not None and authorizer is not None:
+            try:
+                allowed = authorizer(identity, tenant, function_name)
+            except Exception:
+                allowed = False
+            if allowed is not True:
+                raise FlightUnauthorizedError("Function access denied")
         resolver = getattr(self, "_stage_grant_resolver", None)
-        if resolver is not None:
-            # Rebuild grants from verified identity. Never merge a caller's
-            # endpoint/credentials into the trusted resolver result.
+        if resolver is not None or not getattr(
+            self, "_allow_untrusted_stage_mapping", False
+        ):
             headers = {
                 k: v
                 for k, v in headers.items()
                 if k.lower().replace("_", "-") != "databend-stage-mapping"
             }
+        if resolver is not None and include_stage_grants:
             try:
                 grants = resolver(identity, tenant)
                 if not isinstance(grants, Mapping):
@@ -1493,10 +1545,10 @@ class UDFServer(FlightServerBase):
     def do_exchange(self, context, descriptor, reader, writer):
         """Call a function from the client."""
         func_name = descriptor.path[0].decode("utf-8")
+        request_headers = self._request_headers(context, function_name=func_name)
         if func_name not in self._functions:
             raise ValueError(f"Function {func_name} does not exists")
         udf = self._functions[func_name]
-        request_headers = self._request_headers(context)
         writer.begin(udf._result_schema)
 
         # Increment request counter

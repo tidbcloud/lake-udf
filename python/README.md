@@ -431,3 +431,19 @@ is configured, and should only be accepted from trusted callers.
 Both server and client inherit `TIDBCLOUDLAKE_UDF_REQUIRE_TLS` when
 `require_tls=None`. Invalid values fail closed; an explicit boolean overrides
 the environment. Authentication and storage grants do not substitute for TLS.
+
+
+### Network and function access policy
+
+Flight and metrics bind to loopback by default when using the example server.
+A non-loopback Flight service requires TLS and an authentication handler or
+verified client certificates. The metrics listener is local by default. The
+operator may set `TIDBCLOUDLAKE_UDF_ALLOW_INSECURE_NETWORK=1` for a trusted
+legacy network. Keep it disabled for any network reachable by untrusted clients.
+
+With `tenant_resolver`, configure `function_authorizer(identity, tenant, name)`
+to return `True` for the functions that identity may discover and invoke.
+Caller-supplied tenant headers are ignored. Stage grants come from
+`stage_grant_resolver` by default. To run a trusted legacy integration using
+caller-supplied stage mappings, set `allow_untrusted_stage_mapping=True`
+explicitly and restrict which warehouse peer can connect.

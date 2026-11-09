@@ -37,7 +37,7 @@ def multi_stage_process(  # Align with documentation name
 
 
 def create_server(port: int):
-    server = UDFServer(f"0.0.0.0:{port}")
+    server = UDFServer(f"127.0.0.1:{port}", allow_untrusted_stage_mapping=True)
     server.add_function(stage_summary)
     server.add_function(multi_stage_process)
     return server

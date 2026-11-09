@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO)
 
 def create_minimal_server(port=8815):
     """Create server with only built-in functions."""
-    server = UDFServer(f"0.0.0.0:{port}")
+    server = UDFServer(f"127.0.0.1:{port}")
     # Only built-in functions: builtin_echo, builtin_healthy
     return server
 
