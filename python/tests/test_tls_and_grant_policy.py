@@ -23,8 +23,15 @@ def test_verified_identity_replaces_caller_stage_grants():
     server._tenant_resolver = lambda identity: (
         "tenant-a" if identity == b"alice" else None
     )
+    server._functions = {
+        "read_input": Mock(_stage_ref_names=["input"]),
+        "no_stage": Mock(_stage_ref_names=[]),
+    }
     server._stage_grant_resolver = Mock(
-        return_value={"input": {"stage": "owned-stage", "relative_path": "safe/"}}
+        return_value={
+            "input": {"stage": "owned-stage", "relative_path": "safe/"},
+            "unrelated": {"stage": "another-stage", "relative_path": "private/"},
+        }
     )
     context = Mock()
     context.peer_identity.return_value = b"alice"
@@ -35,12 +42,16 @@ def test_verified_identity_replaces_caller_stage_grants():
             "x-databend-tenant": ["tenant-b"],
         }
     )
-    headers = server._request_headers(context)
+    headers = server._request_headers(context, function_name="read_input")
     server._stage_grant_resolver.assert_called_once_with(b"alice", "tenant-a")
     assert headers.tenant == "tenant-a"
     assert "evil.invalid" not in str(headers.raw_headers)
     assert "owned-stage" in str(headers.raw_headers)
+    assert "another-stage" not in str(headers.raw_headers)
+    assert not server._request_headers(
+        context, function_name="no_stage"
+    ).stage_locations
     server._stage_grant_resolver.side_effect = RuntimeError("dummy-secret")
     with pytest.raises(flight.FlightUnauthenticatedError) as error:
-        server._request_headers(context)
+        server._request_headers(context, function_name="read_input")
     assert "dummy-secret" not in str(error.value)

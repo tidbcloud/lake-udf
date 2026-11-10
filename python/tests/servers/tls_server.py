@@ -22,8 +22,8 @@ logging.basicConfig(level=logging.INFO)
 def create_server(port: int) -> UDFServer:
     location = os.environ.get("UDF_LOCATION") or f"127.0.0.1:{port}"
     kwargs = {}
-    if "://" not in location:
-        kwargs["scheme"] = os.environ.get("UDF_SCHEME", "grpc+tls")
+    if "://" not in location and os.environ.get("UDF_SCHEME"):
+        kwargs["scheme"] = os.environ["UDF_SCHEME"]
     cert_path = os.environ.get("UDF_TLS_CERT")
     key_path = os.environ.get("UDF_TLS_KEY")
     if cert_path and key_path:

@@ -10,7 +10,6 @@ that configuration, the default is now a loud warning (not a startup error);
 fail-closed behaviour.
 """
 
-import logging
 import os
 import socket
 import subprocess
@@ -118,25 +117,9 @@ def tls_server(tls_certificates):
         _stop(process)
 
 
-def test_plaintext_with_tls_material_warns_by_default(tls_certificates, caplog):
-    """Default behaviour: warn loudly, then keep the previous plaintext start."""
-    cert_path, key_path = tls_certificates
-    certificates = [(_read(cert_path), _read(key_path))]
-    with caplog.at_level(logging.WARNING, logger="tidbcloudlake_udf.udf"):
-        UDFServer._check_transport_security(
-            "grpc", {"tls_certificates": certificates}, False
-        )
-    warnings = [
-        record.getMessage() for record in caplog.records if record.levelno >= 30
-    ]
-    assert any("PLAINTEXT" in message for message in warnings)
-    assert any("scheme='grpc+tls'" in message for message in warnings)
-
-
-def test_plaintext_with_verify_client_warns_by_default(caplog):
-    with caplog.at_level(logging.WARNING, logger="tidbcloudlake_udf.udf"):
-        UDFServer._check_transport_security("grpc", {"verify_client": True}, False)
-    assert any("PLAINTEXT" in record.getMessage() for record in caplog.records)
+def test_plaintext_with_verify_client_is_rejected():
+    with pytest.raises(ValueError, match="TLS options require"):
+        UDFServer._check_transport_security("grpc", {"verify_client": True})
 
 
 def test_strict_mode_rejects_plaintext_with_tls_material(tls_certificates):
@@ -248,22 +231,21 @@ def test_location_may_carry_the_scheme(tls_certificates):
         _stop(process)
 
 
-def test_client_plaintext_with_tls_options_warns_by_default(tls_certificates, caplog):
-    """Default behaviour keeps working, but says that TLS options are ignored."""
+def test_client_tls_options_select_tls(tls_server, tls_certificates):
     cert_path, _ = tls_certificates
-    with caplog.at_level(logging.WARNING, logger="tidbcloudlake_udf.client"):
-        client = UDFClient("127.0.0.1", 1, tls_root_certs=_read(cert_path))
-    assert client.scheme == "grpc"
-    warnings = [
-        record.getMessage() for record in caplog.records if record.levelno >= 30
-    ]
-    assert any("PLAINTEXT" in message for message in warnings)
+    client = UDFClient("127.0.0.1", tls_server, tls_root_certs=_read(cert_path))
+    assert client.scheme == "grpc+tls"
+    assert client.call_function("builtin_healthy") == [1]
+    client.client.close()
 
 
-def test_client_require_tls_rejects_plaintext(tls_certificates):
+def test_client_rejects_tls_options_with_explicit_plaintext(tls_certificates):
     cert_path, _ = tls_certificates
-    with pytest.raises(ValueError, match="require_tls"):
-        UDFClient("127.0.0.1", 1, tls_root_certs=_read(cert_path), require_tls=True)
+    with pytest.raises(ValueError, match="TLS options require"):
+        UDFClient("127.0.0.1", 1, scheme="grpc", tls_root_certs=_read(cert_path))
+
+
+def test_client_require_tls_rejects_plaintext():
     with pytest.raises(ValueError, match="require_tls"):
         UDFClient("127.0.0.1", 1, require_tls=True)
 
@@ -311,36 +293,14 @@ def _spawn_with_stderr_file(cert_path, key_path, port, stderr_path, **env_overri
         )
 
 
-def _wait_for_plaintext(port, process):
-    client = UDFClient("127.0.0.1", port)
-    for _ in range(50):
-        if process.poll() is not None:
-            raise AssertionError("server exited before becoming ready")
-        try:
-            if client.call_function("builtin_healthy") == [1]:
-                return
-        except Exception:
-            pass
-        time.sleep(0.1)
-    process.terminate()
-    raise AssertionError("plaintext server did not become ready")
-
-
-def test_default_mode_serves_plaintext_with_warning(tmp_path, tls_certificates):
-    """Upgrade path: plaintext + TLS material starts as before, but warns loudly."""
+def test_server_rejects_tls_options_with_explicit_plaintext(tls_certificates):
     cert_path, key_path = tls_certificates
-    port = _free_port()
-    stderr_path = tmp_path / "server.err"
-    process = _spawn_with_stderr_file(
-        cert_path, key_path, port, stderr_path, UDF_SCHEME="grpc"
-    )
-    try:
-        _wait_for_plaintext(port, process)
-        stderr = stderr_path.read_text()
-        assert "PLAINTEXT" in stderr
-        assert "scheme='grpc+tls'" in stderr
-    finally:
-        _stop(process)
+    with pytest.raises(ValueError, match="TLS options require"):
+        UDFServer(
+            "127.0.0.1:0",
+            scheme="grpc",
+            tls_certificates=[(_read(cert_path), _read(key_path))],
+        )
 
 
 def test_strict_env_var_refuses_to_start(tmp_path, tls_certificates):

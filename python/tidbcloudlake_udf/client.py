@@ -1,7 +1,6 @@
 """Simple client library for testing TiDB Cloud Lake UDF servers."""
 
 import json
-import logging
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pyarrow as pa
@@ -20,8 +19,6 @@ PLAINTEXT_SCHEME = "grpc"
 TLS_SCHEME = "grpc+tls"
 _SUPPORTED_SCHEMES = (PLAINTEXT_SCHEME, TLS_SCHEME)
 
-logger = logging.getLogger(__name__)
-
 
 class UDFClient:
     """Simple client for calling UDF functions on a TiDB Cloud Lake UDF server."""
@@ -30,7 +27,7 @@ class UDFClient:
         self,
         host: str = "localhost",
         port: int = 8815,
-        scheme: str = PLAINTEXT_SCHEME,
+        scheme: Optional[str] = None,
         tls_root_certs: bytes = None,
         cert_chain: bytes = None,
         private_key: bytes = None,
@@ -44,24 +41,17 @@ class UDFClient:
         Args:
             host: Server host (default: localhost)
             port: Server port (default: 8815)
-            scheme: Transport scheme, ``"grpc"`` (plaintext, default) or
-                ``"grpc+tls"``.
+            scheme: Transport scheme. Defaults to TLS with TLS options or
+                for a non-loopback host, and plaintext for local development.
             tls_root_certs: PEM-encoded CA certificate(s) used to verify the
                 server when ``scheme="grpc+tls"``.
             cert_chain: PEM-encoded client certificate, for mutual TLS.
             private_key: PEM-encoded client private key, for mutual TLS.
             disable_server_verification: Skip server certificate verification.
             override_hostname: Override the hostname checked by TLS.
-            require_tls: Refuse plaintext; None inherits TIDBCLOUDLAKE_UDF_REQUIRE_TLS,
-                matching previous releases, which allows plaintext with a
-                warning when TLS options are supplied.
+            require_tls: Refuse plaintext. None inherits TIDBCLOUDLAKE_UDF_REQUIRE_TLS.
         """
         require_tls = _resolve_require_tls(require_tls)
-        scheme = scheme.lower()
-        if scheme not in _SUPPORTED_SCHEMES:
-            raise ValueError(
-                f"Unsupported transport scheme {scheme!r}; expected one of {_SUPPORTED_SCHEMES}"
-            )
         tls_options = {
             "tls_root_certs": tls_root_certs,
             "cert_chain": cert_chain,
@@ -72,23 +62,24 @@ class UDFClient:
         tls_options = {
             key: value for key, value in tls_options.items() if value is not None
         }
+        loopback = _is_loopback_host(host)
+        if scheme is None:
+            scheme = TLS_SCHEME if tls_options or not loopback else PLAINTEXT_SCHEME
+        scheme = scheme.lower()
+        if scheme not in _SUPPORTED_SCHEMES:
+            raise ValueError(
+                f"Unsupported transport scheme {scheme!r}; expected one of {_SUPPORTED_SCHEMES}"
+            )
         if scheme == PLAINTEXT_SCHEME:
             if require_tls:
                 raise ValueError(
                     "require_tls=True but the transport scheme is 'grpc', which is "
                     "plaintext. Pass scheme='grpc+tls' to connect over TLS."
                 )
-            if not _is_loopback_host(host) and not _allow_insecure_network():
+            if not loopback and not _allow_insecure_network():
                 raise ValueError("Non-loopback Flight clients require TLS")
             if tls_options:
-                logger.warning(
-                    "UDF client is connecting over PLAINTEXT: the transport scheme "
-                    "is 'grpc', so the TLS options (%s) are being IGNORED and traffic "
-                    "is not encrypted. Pass scheme='grpc+tls' to connect over TLS, "
-                    "or require_tls=True to make this an error.",
-                    ", ".join(sorted(tls_options)),
-                )
-                tls_options = {}
+                raise ValueError("TLS options require scheme='grpc+tls'")
         self.scheme = scheme
         self.location = f"{scheme}://{host}:{port}"
         self.client = fl.FlightClient(self.location, **tls_options)
@@ -426,7 +417,7 @@ class UDFClient:
 def create_client(
     host: str = "localhost",
     port: int = 8815,
-    scheme: str = PLAINTEXT_SCHEME,
+    scheme: Optional[str] = None,
     **kwargs,
 ) -> UDFClient:
     """
