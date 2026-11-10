@@ -14,7 +14,7 @@ def add(a: int, b: int) -> int:
 
 
 if __name__ == "__main__":
-    server = UDFServer("0.0.0.0:8815")
+    server = UDFServer("127.0.0.1:8815")
     server.add_function(add)
     server.serve()
 ```
@@ -25,78 +25,40 @@ python3 my_udf.py
 
 ```sql
 CREATE FUNCTION add (INT, INT) RETURNS INT
-LANGUAGE python HANDLER = 'add' ADDRESS = 'http://0.0.0.0:8815';
+LANGUAGE python HANDLER = 'add' ADDRESS = 'http://127.0.0.1:8815';
 
 SELECT add(1, 2);  -- 3
 ```
 
 ## Transport Security (TLS)
 
-The transport scheme is configurable. It defaults to plaintext `grpc://` for
-backward compatibility; pass `scheme="grpc+tls"` (or a full
-`grpc+tls://host:port` location) to serve over TLS:
+The quick start assumes the query engine and UDF server are on the same
+machine. A non-loopback listener requires TLS, verified peer identity and a
+function authorization policy.
 
 ```python
 server = UDFServer(
     "0.0.0.0:8815",
-    scheme="grpc+tls",
     tls_certificates=[(cert_pem, key_pem)],
-    # Optional mutual TLS:
     verify_client=True,
     root_certificates=ca_pem,
+    function_authorizer=authorize_function,
 )
 server.serve()
 ```
 
-The advertised `CREATE FUNCTION` DDL then uses `https://`.
-
-### Upgrade note: plaintext + TLS material used to be silent
-
-Previous releases hardcoded the plaintext `grpc://` scheme, so passing
-`tls_certificates=` (or `verify_client=`) while keeping the default location
-started a **plaintext** listener with no warning. This release keeps that
-configuration starting — so an upgrade cannot turn a pre-existing
-misconfiguration into a crash loop — but logs a loud warning:
-
-```
-UDF server is serving Flight over PLAINTEXT: the transport scheme is 'grpc',
-so the TLS options (tls_certificates) are being IGNORED and traffic is not
-encrypted. Pass scheme='grpc+tls' ... or pass require_tls=True / set
-TIDBCLOUDLAKE_UDF_REQUIRE_TLS=1 to make this a startup error.
-```
-
-If traffic really is unencrypted, fix the configuration by adding
-`scheme="grpc+tls"`. If you want the SDK to refuse to start instead of warning,
-opt into strict mode:
+The advertised `CREATE FUNCTION` address uses `https://`. Supplying TLS
+certificates selects TLS when the scheme is omitted. Use `scheme="grpc+tls"`
+to select it explicitly. A plaintext scheme with TLS settings is rejected.
+Set `require_tls=True` or `TIDBCLOUDLAKE_UDF_REQUIRE_TLS=1` to require TLS for
+loopback as well.
 
 ```python
-server = UDFServer(
-    "0.0.0.0:8815", scheme="grpc+tls", tls_certificates=..., require_tls=True
-)
+client = UDFClient("udf-server.internal", 8815, tls_root_certs=ca_pem)
 ```
 
-or set the environment variable for the whole deployment:
-
-```bash
-export TIDBCLOUDLAKE_UDF_REQUIRE_TLS=1
-```
-
-In strict mode a plaintext scheme (`grpc`, with or without TLS options) raises
-`ValueError` at construction time. The `grpc+tls` path is unaffected.
-
-The client mirrors the same options:
-
-```python
-from tidbcloudlake_udf import UDFClient
-
-client = UDFClient(
-    "udf-server.internal", 8815, scheme="grpc+tls", tls_root_certs=ca_pem
-)
-```
-
-`UDFClient(..., require_tls=True)` refuses to connect over plaintext; the
-default still allows plaintext (with a warning if TLS options were supplied),
-matching previous releases.
+The client defaults to TLS for non-loopback hosts or when TLS options are
+supplied. Its default local connection uses plaintext.
 
 ### Certificates on the engine side
 
@@ -308,7 +270,7 @@ to disable the bound) only if the query engine is configured to send larger
 batches, and remember that larger batches mean more memory per request:
 
 ```python
-server = UDFServer("0.0.0.0:8815", max_batch_rows=4_000_000)
+server = UDFServer("127.0.0.1:8815", max_batch_rows=4_000_000)
 ```
 
 Per-row work is also submitted in windows sized to `io_threads`, so the number
@@ -323,7 +285,7 @@ Edit the TiDB Cloud Lake query service config:
 ```toml
 [query]
 enable_udf_server = true
-udf_server_allow_list = ["http://0.0.0.0:8815"]
+udf_server_allow_list = ["http://127.0.0.1:8815"]
 ```
 
 ### UDF Decorator Parameters
@@ -387,7 +349,7 @@ Inspired by [RisingWave Python API](https://pypi.org/project/risingwave/).
 without an Arrow Flight authentication handler. TLS with `verify_client=True`
 also satisfies this guard. Combine this with `scheme="grpc+tls"` and
 `require_tls=True`; authentication alone does not encrypt query data or stage
-credentials. Existing defaults remain unchanged for existing engine clients.
+credentials. Pass `function_authorizer` to choose which functions each verified peer can call.
 
 For shared services, pass `tenant_resolver=resolve_tenant` to map the verified
 `context.peer_identity()` bytes to an authorized tenant string. It requires an
@@ -397,12 +359,13 @@ rejects the request. Configure the resolver with your trusted identity-to-tenant
 mapping; it must not derive the tenant from request headers. Verify that your
 engine supports the selected Flight authentication or mTLS configuration. mTLS
 alone does not guarantee Arrow exposes a peer identity suitable for this mapping.
-Without a resolver, `headers.tenant` remains untrusted request metadata.
+Without a resolver, `headers.tenant` is empty.
 
 ### Request resource budgets
 
 `UDFServer` defaults to 64 MiB per decoded input/output batch and, separately for
-each direction, 10 million rows / 256 MiB per DoExchange stream. Configure these
+each direction, 10 million rows / 256 MiB per DoExchange stream. At most 32 exchanges run concurrently by default.
+Configure concurrency with `max_concurrent_requests` and the stream limits
 with positive `max_batch_bytes`, `max_stream_rows` and `max_stream_bytes` values.
 The existing per-batch row limit also applies to output. Table-function iterables
 and column mappings are consumed in chunks of at most 1024 rows, so even an
@@ -421,10 +384,11 @@ by these counters. Arbitrary function isolation requires a separate worker desig
 
 For a shared authenticated server, pass `tenant_resolver(identity)` and
 `stage_grant_resolver(identity, tenant)` alongside `auth_handler` or mTLS. The
-stage resolver returns the stage-mapping dictionary from trusted configuration;
-request-supplied mapping headers are removed and replaced. Returning an empty
-mapping grants no stages. Resolver failures reject the request without exposing
-credentials. Refresh/revoke grants in the resolver; it is called on every RPC.
+stage resolver returns the stage-mapping dictionary from trusted configuration.
+The server forwards only grants for the requested function’s declared stage
+references. An empty mapping grants no stages. Resolver failures reject the
+request without exposing credentials. The resolver runs on each invocation of
+a function that declares stage references.
 Legacy caller-delegated stage credentials remain available when no stage resolver
 is configured, and should only be accepted from trusted callers.
 
@@ -437,8 +401,8 @@ the environment. Authentication and storage grants do not substitute for TLS.
 
 Flight and metrics bind to loopback by default when using the example server.
 A non-loopback Flight service requires TLS and an authentication handler or
-verified client certificates. The metrics listener is local by default. The
-operator may set `TIDBCLOUDLAKE_UDF_ALLOW_INSECURE_NETWORK=1` for a trusted
+verified client certificates. The unauthenticated metrics listener accepts only
+loopback addresses. The operator may set `TIDBCLOUDLAKE_UDF_ALLOW_INSECURE_NETWORK=1` for a trusted
 legacy network. Keep it disabled for any network reachable by untrusted clients.
 
 With `tenant_resolver`, configure `function_authorizer(identity, tenant, name)`

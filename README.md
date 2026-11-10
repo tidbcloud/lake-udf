@@ -30,13 +30,13 @@ def add(left: int, right: int) -> int:
 
 
 if __name__ == "__main__":
-    server = UDFServer("0.0.0.0:8815")
+    server = UDFServer("127.0.0.1:8815")
     server.add_function(add)
     server.serve()
 ```
 
-Start the server on an address reachable by the query service, then register and
-call the function:
+For local testing with the query engine on the same machine, start the server
+and register the loopback endpoint:
 
 ```bash
 python3 my_udf.py
@@ -44,14 +44,15 @@ python3 my_udf.py
 
 ```sql
 CREATE FUNCTION add (INT, INT) RETURNS INT
-LANGUAGE python HANDLER = 'add' ADDRESS = 'http://<udf-server-host>:8815';
+LANGUAGE python HANDLER = 'add' ADDRESS = 'http://127.0.0.1:8815';
 
 SELECT add(1, 2); -- 3
 ```
 
-The UDF endpoint must be permitted by your TiDB Cloud Lake UDF server allow
-list. Do not use `0.0.0.0` as the `ADDRESS` in `CREATE FUNCTION`; replace the
-placeholder with the hostname or IP address that TiDB Cloud Lake can reach.
+For TiDB Cloud Lake, configure a reachable HTTPS endpoint with Flight
+authentication and a function authorization policy. Use that endpoint in
+`CREATE FUNCTION` and add it to the warehouse UDF server allow list.
+See the [transport security setup](python/README.md#transport-security-tls).
 
 ## More Examples
 

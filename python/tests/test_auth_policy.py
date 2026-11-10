@@ -10,7 +10,7 @@ from tidbcloudlake_udf import UDFServer, udf
 def test_strict_auth_rejects_anonymous_configuration():
     with pytest.raises(ValueError, match="requires"):
         UDFServer("127.0.0.1:0", require_auth=True)
-    with pytest.raises(ValueError, match="requires"):
+    with pytest.raises(ValueError, match="TLS options require"):
         UDFServer("127.0.0.1:0", verify_client=True, require_auth=True)
     with pytest.raises(ValueError, match="requires"):
         UDFServer("127.0.0.1:0", tenant_resolver=lambda _: "tenant")
@@ -29,7 +29,11 @@ def test_tenant_comes_from_verified_identity():
     context = Mock()
     context.peer_identity.return_value = b"authenticated-user"
     context.get_middleware.return_value = SimpleNamespace(
-        headers={"X-Databend-Tenant": ["forged"], "x-databend-tenant": ["also-forged"]}
+        headers={
+            "X-Databend-Tenant": ["forged"],
+            "x-databend-tenant": ["also-forged"],
+            "X_DATABEND_TENANT": ["alias"],
+        }
     )
     headers = server._request_headers(context)
     resolver.assert_called_once_with(b"authenticated-user")
@@ -136,3 +140,33 @@ def test_unverified_stage_and_tenant_headers_are_ignored():
         }
     )
     assert server._request_headers(context).raw_headers == {}
+
+
+def test_authenticated_server_requires_function_authorizer():
+    with pytest.raises(ValueError, match="function_authorizer"):
+        UDFServer("127.0.0.1:0", require_auth=True, auth_handler=_ServerAuth())
+
+
+def test_metrics_remain_loopback_only_in_legacy_mode(monkeypatch):
+    monkeypatch.setenv("TIDBCLOUDLAKE_UDF_ALLOW_INSECURE_NETWORK", "1")
+    with pytest.raises(ValueError, match="metrics listener requires loopback"):
+        UDFServer("127.0.0.1:0", metric_location="0.0.0.0:9090")
+
+
+def test_concurrent_exchange_limit_rejects_and_recovers():
+    from threading import BoundedSemaphore
+
+    from tidbcloudlake_udf.udf import ConcurrencyLimitExceeded
+
+    server = policy_server(None)
+    server._request_slots = BoundedSemaphore(1)
+    server._do_exchange = Mock(side_effect=RuntimeError("test error"))
+    with server._request_slots:
+        with pytest.raises(
+            ConcurrencyLimitExceeded, match="Server request concurrency"
+        ):
+            server.do_exchange(None, None, None, None)
+    server._do_exchange.assert_not_called()
+    with pytest.raises(RuntimeError, match="test error"):
+        server.do_exchange(None, None, None, None)
+    assert server._request_slots.acquire(blocking=False)

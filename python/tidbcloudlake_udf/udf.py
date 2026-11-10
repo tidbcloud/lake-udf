@@ -78,11 +78,8 @@ _SUPPORTED_SCHEMES = (PLAINTEXT_SCHEME, TLS_SCHEME)
 # TLS-related kwargs accepted by ``pyarrow.flight.FlightServerBase``.
 _TLS_SERVER_KWARGS = ("tls_certificates", "root_certificates", "verify_client")
 
-# Opt-in strict transport security. TLS material handed to a plaintext location
-# used to be silently ignored by pyarrow; failing hard at construction time would
-# turn that (pre-existing) misconfiguration into a crash loop on upgrade, so the
-# default is a loud runtime warning. Setting this environment variable to a
-# truthy value (or passing ``require_tls=True``) refuses to serve plaintext.
+# Setting this environment variable or passing ``require_tls=True``
+# also requires TLS for loopback Flight.
 REQUIRE_TLS_ENV_VAR = "TIDBCLOUDLAKE_UDF_REQUIRE_TLS"
 _TRUTHY_ENV_VALUES = ("1", "true", "yes", "on")
 
@@ -98,6 +95,7 @@ DEFAULT_MAX_BATCH_ROWS = 1_000_000
 DEFAULT_MAX_BATCH_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_STREAM_ROWS = 10_000_000
 DEFAULT_MAX_STREAM_BYTES = 256 * 1024 * 1024
+DEFAULT_MAX_CONCURRENT_REQUESTS = 32
 OUTPUT_CHUNK_ROWS = 1024
 
 logger = logging.getLogger(__name__)
@@ -1237,11 +1235,10 @@ class UDFServer(FlightServerBase):
     ``max_batch_rows`` bounds the row count an inbound RecordBatch may declare
     (default ``DEFAULT_MAX_BATCH_ROWS``); pass ``None`` to disable the bound.
 
-    ``require_tls`` opts into strict transport security: with
-    ``require_tls=True`` (or ``TIDBCLOUDLAKE_UDF_REQUIRE_TLS=1``) a plaintext
-    ``grpc`` scheme is refused instead of warning. The default is ``False`` so
-    that deployments which used to serve plaintext with TLS options keep
-    starting (with a warning) after upgrading.
+    Plaintext and anonymous Flight are limited to loopback by default.
+    Supplying TLS certificates selects TLS when no scheme is provided.
+    Set ``require_tls=True`` (or ``TIDBCLOUDLAKE_UDF_REQUIRE_TLS=1``) to
+    require TLS on loopback too.
     """
 
     _location: str
@@ -1269,6 +1266,7 @@ class UDFServer(FlightServerBase):
             Callable[[bytes, Optional[str], str], bool]
         ] = None,
         allow_untrusted_stage_mapping: bool = False,
+        max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS,
         **kwargs,
     ):
         location_scheme, address = _split_location(location)
@@ -1279,14 +1277,16 @@ class UDFServer(FlightServerBase):
                     f"but scheme={scheme!r}"
                 )
         resolved_scheme = _normalize_scheme(
-            location_scheme or scheme or PLAINTEXT_SCHEME
+            location_scheme
+            or scheme
+            or (TLS_SCHEME if kwargs.get("tls_certificates") else PLAINTEXT_SCHEME)
         )
         self._require_tls = _resolve_require_tls(require_tls)
         self._check_transport_security(resolved_scheme, kwargs, self._require_tls)
         if not isinstance(require_auth, bool):
             raise ValueError("require_auth must be a boolean")
         authenticated = kwargs.get("auth_handler") is not None or (
-            resolved_scheme == "grpc+tls" and kwargs.get("verify_client") is True
+            resolved_scheme == TLS_SCHEME and kwargs.get("verify_client") is True
         )
         if (
             require_auth
@@ -1301,19 +1301,15 @@ class UDFServer(FlightServerBase):
             raise ValueError("tenant_resolver must be callable")
         if function_authorizer is not None and not callable(function_authorizer):
             raise ValueError("function_authorizer must be callable")
-        if tenant_resolver is not None and function_authorizer is None:
-            raise ValueError("tenant_resolver requires a function_authorizer")
         host = address.rsplit(":", 1)[0]
-        if not _is_loopback_host(host) and not (
-            resolved_scheme == "grpc+tls" and authenticated
-        ):
+        loopback = _is_loopback_host(host)
+        if authenticated and function_authorizer is None:
+            raise ValueError("Authenticated service requires a function_authorizer")
+        if not loopback and not (resolved_scheme == TLS_SCHEME and authenticated):
             if not _allow_insecure_network():
                 raise ValueError("Non-loopback Flight requires TLS and authentication")
         if metric_location and not _is_loopback_host(metric_location.rsplit(":", 1)[0]):
-            if not _allow_insecure_network():
-                raise ValueError(
-                    "The unauthenticated metrics listener requires loopback"
-                )
+            raise ValueError("The unauthenticated metrics listener requires loopback")
         self._require_auth = require_auth or authenticated
         self._function_authorizer = function_authorizer
         if not isinstance(allow_untrusted_stage_mapping, bool):
@@ -1342,6 +1338,10 @@ class UDFServer(FlightServerBase):
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
             setattr(self, "_" + name, value)
+
+        if type(max_concurrent_requests) is not int or max_concurrent_requests <= 0:
+            raise ValueError("max_concurrent_requests must be a positive integer")
+        self._request_slots = threading.BoundedSemaphore(max_concurrent_requests)
 
         middleware = dict(kwargs.pop("middleware", {}))
         middleware.setdefault("log_headers", HeadersMiddlewareFactory())
@@ -1413,17 +1413,7 @@ class UDFServer(FlightServerBase):
     def _check_transport_security(
         scheme: str, kwargs: Mapping[str, Any], require_tls: bool = False
     ) -> None:
-        """Fail (strict mode) or warn when the served transport is plaintext.
-
-        pyarrow derives the transport security from the location scheme, so a
-        plaintext ``grpc://`` location makes it drop ``tls_certificates`` /
-        ``verify_client`` / ``root_certificates`` and keep serving cleartext
-        with no error. Because previous releases behaved this way silently, the
-        default is a loud warning so an upgrade does not turn a pre-existing
-        misconfiguration into a crash loop; pass ``require_tls=True`` (or set
-        ``TIDBCLOUDLAKE_UDF_REQUIRE_TLS=1``) to refuse to start instead.
-        """
-        tls_material = [name for name in _TLS_SERVER_KWARGS if kwargs.get(name)]
+        """Reject TLS settings that Arrow Flight would otherwise ignore."""
         if scheme == TLS_SCHEME:
             if not kwargs.get("tls_certificates"):
                 raise ValueError(
@@ -1432,23 +1422,10 @@ class UDFServer(FlightServerBase):
             return
         if require_tls:
             raise ValueError(
-                "require_tls is enabled (require_tls=True or "
-                f"{REQUIRE_TLS_ENV_VAR}=1) but the transport scheme is 'grpc', "
-                "which is plaintext. Pass scheme='grpc+tls' (or an explicit "
-                "'grpc+tls://host:port' location) with "
-                "tls_certificates=[(cert_pem, key_pem)] to serve over TLS, or "
-                "drop the strict flag to serve plaintext with a warning."
+                "require_tls is enabled but the transport scheme is plaintext"
             )
-        if tls_material:
-            logger.warning(
-                "UDF server is serving Flight over PLAINTEXT: the transport scheme "
-                "is 'grpc', so the TLS options (%s) are being IGNORED and traffic "
-                "is not encrypted. Pass scheme='grpc+tls' with "
-                "tls_certificates=[(cert_pem, key_pem)] to serve over TLS, or pass "
-                "require_tls=True / set %s=1 to make this a startup error.",
-                ", ".join(tls_material),
-                REQUIRE_TLS_ENV_VAR,
-            )
+        if any(kwargs.get(name) for name in _TLS_SERVER_KWARGS):
+            raise ValueError("TLS options require scheme='grpc+tls'")
 
     def _start_metrics_server(self):
         """Start Prometheus metrics HTTP server if metric_location is provided"""
@@ -1499,7 +1476,11 @@ class UDFServer(FlightServerBase):
         headers = dict(middleware.headers) if middleware else {}
         tenant = None
         identity = None
-        headers = {k: v for k, v in headers.items() if k.lower() != "x-databend-tenant"}
+        headers = {
+            k: v
+            for k, v in headers.items()
+            if k.lower().replace("_", "-") != "x-databend-tenant"
+        }
         if getattr(self, "_require_auth", False) or self._tenant_resolver is not None:
             identity = context.peer_identity()
             if not identity:
@@ -1530,12 +1511,21 @@ class UDFServer(FlightServerBase):
                 for k, v in headers.items()
                 if k.lower().replace("_", "-") != "databend-stage-mapping"
             }
-        if resolver is not None and include_stage_grants:
+        function = (
+            self._functions.get(function_name) if function_name is not None else None
+        )
+        stage_refs = function._stage_ref_names if function is not None else []
+        if resolver is not None and include_stage_grants and stage_refs:
             try:
                 grants = resolver(identity, tenant)
                 if not isinstance(grants, Mapping):
                     raise ValueError("Invalid stage grant result")
-                headers["databend-stage-mapping"] = [json.dumps(dict(grants))]
+                if not all(isinstance(value, Mapping) for value in grants.values()):
+                    entry_ref = _extract_param_name(grants)
+                    if entry_ref:
+                        grants = {entry_ref: dict(grants)}
+                selected = {ref: grants[ref] for ref in stage_refs if ref in grants}
+                headers["databend-stage-mapping"] = [json.dumps(selected)]
             except Exception:
                 raise FlightUnauthenticatedError(
                     "No authorized stage grants for this identity"
@@ -1543,7 +1533,15 @@ class UDFServer(FlightServerBase):
         return Headers(headers, context=context)
 
     def do_exchange(self, context, descriptor, reader, writer):
-        """Call a function from the client."""
+        """Call a function within the server-wide concurrency limit."""
+        if not self._request_slots.acquire(blocking=False):
+            raise ConcurrencyLimitExceeded("Server request concurrency limit reached")
+        try:
+            self._do_exchange(context, descriptor, reader, writer)
+        finally:
+            self._request_slots.release()
+
+    def _do_exchange(self, context, descriptor, reader, writer):
         func_name = descriptor.path[0].decode("utf-8")
         request_headers = self._request_headers(context, function_name=func_name)
         if func_name not in self._functions:
