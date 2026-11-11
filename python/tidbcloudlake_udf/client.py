@@ -49,9 +49,17 @@ class UDFClient:
             private_key: PEM-encoded client private key, for mutual TLS.
             disable_server_verification: Skip server certificate verification.
             override_hostname: Override the hostname checked by TLS.
-            require_tls: Refuse plaintext. None inherits TIDBCLOUDLAKE_UDF_REQUIRE_TLS.
+            require_tls: Require TLS with certificate and hostname verification.
+                None inherits TIDBCLOUDLAKE_UDF_REQUIRE_TLS.
         """
         require_tls = _resolve_require_tls(require_tls)
+        if require_tls and (
+            disable_server_verification or override_hostname is not None
+        ):
+            raise ValueError(
+                "require_tls=True requires server certificate verification for the configured host. "
+                "Remove disable_server_verification and override_hostname."
+            )
         tls_options = {
             "tls_root_certs": tls_root_certs,
             "cert_chain": cert_chain,

@@ -58,7 +58,11 @@ client = UDFClient("udf-server.internal", 8815, tls_root_certs=ca_pem)
 ```
 
 The client defaults to TLS for non-loopback hosts or when TLS options are
-supplied. Its default local connection uses plaintext.
+supplied. Its default local connection uses plaintext. With
+`require_tls=True` (or `TIDBCLOUDLAKE_UDF_REQUIRE_TLS=1`), the client requires
+a trusted server certificate for the configured host. Use `tls_root_certs`
+to provide a private CA. Strict mode rejects `disable_server_verification=True`
+and `override_hostname`.
 
 ### Certificates on the engine side
 
