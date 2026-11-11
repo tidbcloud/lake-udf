@@ -250,6 +250,25 @@ def test_client_require_tls_rejects_plaintext():
         UDFClient("127.0.0.1", 1, require_tls=True)
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"disable_server_verification": True},
+        {"override_hostname": "other.example"},
+    ],
+)
+@pytest.mark.parametrize("strict_from_env", [False, True])
+def test_client_require_tls_rejects_verification_overrides(
+    monkeypatch, options, strict_from_env
+):
+    if strict_from_env:
+        monkeypatch.setenv("TIDBCLOUDLAKE_UDF_REQUIRE_TLS", "1")
+    else:
+        options = {**options, "require_tls": True}
+    with pytest.raises(ValueError, match="requires server certificate verification"):
+        UDFClient("udf.example", 8815, **options)
+
+
 def test_client_require_tls_allows_tls(tls_server, tls_certificates):
     cert_path, _ = tls_certificates
     client = UDFClient(
@@ -257,6 +276,7 @@ def test_client_require_tls_allows_tls(tls_server, tls_certificates):
         tls_server,
         scheme="grpc+tls",
         tls_root_certs=_read(cert_path),
+        disable_server_verification=False,
         require_tls=True,
     )
     assert client.scheme == "grpc+tls"
